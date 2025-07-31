@@ -1,7 +1,10 @@
 import React, { useState, useEffect } from 'react'; // useCallback은 더 이상 필요 없으므로 제거
+import { NativeModules } from 'react-native';
 import { StyleSheet, View, TouchableOpacity, Image, Text } from 'react-native';
 import CameraView from './screens/CameraView'; // 업데이트된 CameraView 컴포넌트
 import SplashScreen from './screens/SplashScreen'; // SplashScreen 컴포넌트 임포트
+
+const { IATModelModule } = NativeModules;
 
 // 미디어 타입을 위한 인터페이스
 interface Media {
@@ -15,9 +18,16 @@ function App(): React.JSX.Element {
 
   // 스플래시 화면 표시를 위한 타이머 로직 (App 컴포넌트에서 관리)
   useEffect(() => {
+    console.log('IATModelModule 객체:', IATModelModule);
+
     const timer = setTimeout(() => {
       setShowSplash(false);
     }, 3000); // 3초 후에 스플래시 화면을 숨깁니다.
+
+    // 모델 초기화 호출
+    NativeModules.IATModelModule.initializeModel()
+    .then((result: any) => console.log('Model initialized:', result))
+    .catch((error: any) => console.error('Failed to initialize model:', error));
 
     // 컴포넌트 언마운트 시 타이머를 클리어합니다.
     return () => clearTimeout(timer);
