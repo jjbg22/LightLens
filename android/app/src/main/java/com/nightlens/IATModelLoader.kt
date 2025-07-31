@@ -1,46 +1,13 @@
-package com.lightlens
+package com.nightlens
 
-import android.content.Context
-import android.content.res.AssetFileDescriptor
 import android.graphics.Bitmap
-import android.graphics.BitmapFactory
-import org.tensorflow.lite.Interpreter
-import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
-import java.nio.MappedByteBuffer
-import java.nio.channels.FileChannel
 
-class IATModelLoader(private val context: Context) {
+class IATModelLoader { // Context 불필요
 
-    private val interpreter: Interpreter
-
-    init {
-        interpreter = Interpreter(loadModelFile("IAT.tflite"))
-    }
-
-    private fun loadModelFile(modelPath: String): MappedByteBuffer {
-        val assetManager = context.assets
-        val fileDescriptor: AssetFileDescriptor = assetManager.openFd(modelPath)
-        val inputStream = FileInputStream(fileDescriptor.fileDescriptor)
-        val fileChannel: FileChannel = inputStream.channel
-        val startOffset = fileDescriptor.startOffset
-        val declaredLength = fileDescriptor.declaredLength
-        return fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
-    }
-
-    fun runModel(inputBitmap: Bitmap): Bitmap {
-        val inputBuffer = convertBitmapToByteBuffer(inputBitmap)
-        val outputBuffer = ByteBuffer.allocateDirect(1 * 256 * 256 * 3 * 4)
-        outputBuffer.order(ByteOrder.nativeOrder())
-
-        interpreter.run(inputBuffer, outputBuffer)
-        outputBuffer.rewind()
-
-        return convertByteBufferToBitmap(outputBuffer, 256, 256)
-    }
-
-    private fun convertBitmapToByteBuffer(bitmap: Bitmap): ByteBuffer {
+    // Bitmap을 모델 입력(ByteBuffer)으로 변환
+    fun convertBitmapToByteBuffer(bitmap: Bitmap): ByteBuffer {
         val resizedBitmap = Bitmap.createScaledBitmap(bitmap, 256, 256, true)
         val byteBuffer = ByteBuffer.allocateDirect(1 * 256 * 256 * 3 * 4)
         byteBuffer.order(ByteOrder.nativeOrder())
@@ -55,12 +22,12 @@ class IATModelLoader(private val context: Context) {
             byteBuffer.putFloat(g)
             byteBuffer.putFloat(b)
         }
-
         byteBuffer.rewind()
         return byteBuffer
     }
 
-    private fun convertByteBufferToBitmap(buffer: ByteBuffer, width: Int, height: Int): Bitmap {
+    // 모델 출력(ByteBuffer)을 Bitmap으로 변환
+    fun convertByteBufferToBitmap(buffer: ByteBuffer, width: Int, height: Int): Bitmap {
         buffer.rewind()
         val pixels = IntArray(width * height)
         for (i in 0 until width * height) {
@@ -69,11 +36,6 @@ class IATModelLoader(private val context: Context) {
             val b = (buffer.float * 255.0f).toInt().coerceIn(0, 255)
             pixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
         }
-
         return Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
-    }
-
-    fun close() {
-        interpreter.close()
     }
 }

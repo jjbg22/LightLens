@@ -1,4 +1,4 @@
-package com.lightlens
+package com.nightlens
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -12,19 +12,17 @@ import org.tensorflow.lite.Interpreter
 import java.io.FileInputStream
 import java.nio.channels.FileChannel
 
-
 @ReactModule(name = IATModelModule.NAME)
 class IATModelModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext), LifecycleEventListener {
 
-    private var tflite: Interpreter? = null
+    private var interpreter: Interpreter? = null
+    private var dataConverter: IATModelLoader? = null
+    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
     companion object {
         const val NAME = "IATModelModule"
     }
-
-    private var model: IATModelLoader? = null
-    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
     override fun getName(): String = NAME
 
@@ -34,6 +32,10 @@ class IATModelModule(private val reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun initializeModel(promise: Promise) {
+        if (interpreter != null) {
+            promise.resolve("Model already initialized")
+            return
+        }
         try {
             val assetFileDescriptor = reactContext.assets.openFd("IAT.tflite")
             val fileInputStream = FileInputStream(assetFileDescriptor.fileDescriptor)
@@ -42,18 +44,18 @@ class IATModelModule(private val reactContext: ReactApplicationContext) :
             val declaredLength = assetFileDescriptor.declaredLength
             val modelBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
 
-            tflite = Interpreter(modelBuffer)
-
-            model = IATModelLoader(reactContext)
-            promise.resolve("Model initialized")
+            interpreter = Interpreter(modelBuffer)
+            dataConverter = IATModelLoader()
+            
+            promise.resolve("Model initialized successfully")
         } catch (e: Exception) {
             promise.reject("MODEL_INIT_FAILED", e.message, e)
         }
     }
 
     @ReactMethod
-    fun runModel(base64Input: String, promise: Promise) {
-        if (model == null) {
+    fun runModelOnImage(base64Input: String, promise: Promise) {
+        if (interpreter == null || dataConverter == null) {
             promise.reject("MODEL_NOT_INITIALIZED", "Call initializeModel() first.")
             return
         }
@@ -62,13 +64,15 @@ class IATModelModule(private val reactContext: ReactApplicationContext) :
             try {
                 val inputBytes = Base64.decode(base64Input, Base64.DEFAULT)
                 val inputBitmap = BitmapFactory.decodeByteArray(inputBytes, 0, inputBytes.size)
+                val inputBuffer = dataConverter!!.convertBitmapToByteBuffer(inputBitmap)
+                val outputBuffer = ByteBuffer.allocateDirect(1 * 256 * 256 * 3 * 4).order(ByteOrder.nativeOrder())
 
-                val outputBitmap = model!!.runModel(inputBitmap)
+                interpreter!!.run(inputBuffer, outputBuffer)
 
+                val outputBitmap = dataConverter!!.convertByteBufferToBitmap(outputBuffer, 256, 256)
                 val outputStream = java.io.ByteArrayOutputStream()
                 outputBitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
-                val outputBytes = outputStream.toByteArray()
-                val outputBase64 = Base64.encodeToString(outputBytes, Base64.NO_WRAP)
+                val outputBase64 = Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
 
                 withContext(Dispatchers.Main) {
                     promise.resolve(outputBase64)
@@ -81,71 +85,24 @@ class IATModelModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    // React Native Lifecycle events
+    // ❗️ 아래 함수들이 누락되어 있었습니다.
     override fun onHostResume() {
-        // 필요시 구현
+        // 필수 구현 (내용은 없어도 됨)
     }
 
     override fun onHostPause() {
-        // 필요시 구현
+        // 필수 구현 (내용은 없어도 됨)
     }
 
     override fun onHostDestroy() {
-        model?.close()
+        interpreter?.close()
         scope.cancel()
         reactContext.removeLifecycleEventListener(this)
     }
 
     override fun invalidate() {
         super.invalidate()
-        model?.close()
+        interpreter?.close()
         scope.cancel()
     }
-
-    @ReactMethod
-    fun runInference(imageData: ReadableArray, promise: Promise) {
-        try {
-            if (tflite == null) {
-                promise.reject("ModelNotInitialized", "모델이 초기화되지 않았습니다.")
-                return
-            }
-
-            // 입력 이미지: [1, 3, 256, 256]
-            val inputSize = 1 * 3 * 256 * 256
-            if (imageData.size() != inputSize) {
-                promise.reject("InvalidInput", "입력 데이터 크기가 올바르지 않습니다.")
-                return
-            }
-
-            val inputBuffer = ByteBuffer.allocateDirect(4 * inputSize).order(ByteOrder.nativeOrder())
-            for (i in 0 until inputSize) {
-                inputBuffer.putFloat(imageData.getDouble(i).toFloat())
-            }
-            inputBuffer.rewind()
-
-            // 출력 버퍼 초기화: 출력도 [1, 3, 256, 256]
-            val outputSize = 1 * 3 * 256 * 256
-            val outputBuffer = ByteBuffer.allocateDirect(4 * outputSize).order(ByteOrder.nativeOrder())
-            outputBuffer.rewind()
-
-            val outputs: MutableMap<Int, Any> = HashMap()
-            outputs[0] = outputBuffer
-
-            val inputs: Array<Any> = arrayOf(inputBuffer)
-
-            tflite!!.runForMultipleInputsOutputs(inputs, outputs)
-
-            outputBuffer.rewind()
-            val resultArray = WritableNativeArray()
-            for (i in 0 until outputSize) {
-                resultArray.pushDouble(outputBuffer.getFloat().toDouble())
-            }
-
-            promise.resolve(resultArray)
-
-        } catch (e: Exception) {
-            promise.reject("InferenceFailed", e.message, e)
-        }
-    }
-
 }

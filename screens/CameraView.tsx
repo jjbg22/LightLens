@@ -8,11 +8,11 @@ import {
   PermissionsAndroid,
   Platform,
   Alert,
-  Switch, // 토글 스위치를 위해 Switch를 import 합니다.
-  Linking, // 갤러리 앱을 열기 위해 Linking을 import 합니다.
-  Animated, // 애니메이션을 위해 Animated를 import 합니다.
-  // PanResponder, // 슬라이드 제스처를 위해 PanResponder는 더 이상 사용하지 않습니다.
-  // Dimensions, // 화면 크기를 얻기 위해 Dimensions는 더 이상 사용하지 않습니다.
+  Switch,
+  Linking,
+  Animated,
+  ActivityIndicator,
+  LayoutChangeEvent, // onLayout 이벤트 타입을 위해 추가
 } from 'react-native';
 import { CameraRoll } from '@react-native-camera-roll/camera-roll';
 import {
@@ -22,14 +22,12 @@ import {
 } from 'react-native-vision-camera';
 import { Svg, Path, Circle } from 'react-native-svg';
 import { NativeModules } from 'react-native';
+import RNFS from 'react-native-fs';
 
 const { IATModelModule } = NativeModules;
 
-interface CameraViewProps {
-  onMediaCaptured: (media: { path: string; type: 'photo' | 'video' }) => void;
-}
-
-function CameraView({ onMediaCaptured }: CameraViewProps): React.JSX.Element {
+// 이제 이 컴포넌트는 독립적으로 동작하므로 props가 필요 없습니다.
+function CameraView(): React.JSX.Element {
   const { hasPermission, requestPermission } = useCameraPermission();
   const [devicePosition, setDevicePosition] = useState<'front' | 'back'>('back');
   const device = useCameraDevice(devicePosition);
@@ -39,32 +37,28 @@ function CameraView({ onMediaCaptured }: CameraViewProps): React.JSX.Element {
   const [isRecording, setIsRecording] = useState(false);
   const [latestPhoto, setLatestPhoto] = useState<string | null>(null);
 
-  // --- 설정 관련 상태 추가 ---
   const [isSettingsVisible, setIsSettingsVisible] = useState(false);
   const [isNightModeEnabled, setIsNightModeEnabled] = useState(true);
   const [isDetectionModeEnabled, setIsDetectionModeEnabled] = useState(false);
 
-  // --- 플래시 효과를 위한 상태 추가 ---
-  const flashOpacity = useRef(new Animated.Value(0)).current; // 애니메이션 값
+  const flashOpacity = useRef(new Animated.Value(0)).current;
+  const [isLoading, setIsLoading] = useState(false);
 
-  // --- 변환 중 인디케이터를 위한 상태 추가 ---
-  const [isConverting, setIsConverting] = useState(false);
-
-  // PanResponder 관련 코드는 제거합니다.
-  // const photoTextTranslateX = useRef(new Animated.Value(0)).current;
-  // const photoTextOpacity = useRef(new Animated.Value(1)).current;
-  // const videoTextTranslateX = useRef(new Animated.Value(0)).current;
-  // const videoTextOpacity = useRef(new Animated.Value(0.5)).current;
-  // const modeSwitchPanResponder = useRef(...).current;
-  // useEffect(() => { ... }, [captureMode]); // 이 useEffect도 제거합니다.
+  // --- ❗️ 애니메이션을 위한 상태 추가 ---
+  const [animatingImage, setAnimatingImage] = useState<{ uri: string } | null>(null);
+  const animatedValue = useRef(new Animated.Value(0)).current;
+  const [galleryIconLayout, setGalleryIconLayout] = useState({ x: 0, y: 0, width: 0, height: 0 });
 
   useEffect(() => {
     if (!hasPermission) {
       requestPermission();
     }
     requestAndroidPermissions();
-    fetchLatestPhoto();
-  }, [hasPermission, requestPermission]);
+
+    IATModelModule.initializeModel()
+      .then((result: string) => console.log('Model Initialization:', result))
+      .catch((error: Error) => Alert.alert('모델 초기화 실패', error.message));
+  }, [hasPermission]);
 
   const requestAndroidPermissions = async () => {
     if (Platform.OS === 'android') {
@@ -72,21 +66,11 @@ function CameraView({ onMediaCaptured }: CameraViewProps): React.JSX.Element {
         PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES,
         PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
       ]);
-      
-      const readMediaImagesStatus = statuses[PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES];
-      const recordAudioStatus = statuses[PermissionsAndroid.PERMISSIONS.RECORD_AUDIO];
-
-      if (recordAudioStatus !== 'granted') {
-        console.log('마이크 권한이 거부되었습니다. 영상 녹화 시 소리가 녹음되지 않습니다.');
-      }
-      
-      if (readMediaImagesStatus === 'granted') {
+      if (statuses[PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES] === 'granted') {
         fetchLatestPhoto();
-      } else {
-        console.log('갤러리 접근 권한이 거부되었습니다.');
       }
     } else {
-        fetchLatestPhoto();
+      fetchLatestPhoto();
     }
   };
 
@@ -95,8 +79,6 @@ function CameraView({ onMediaCaptured }: CameraViewProps): React.JSX.Element {
       const { edges } = await CameraRoll.getPhotos({ first: 1, assetType: 'Photos' });
       if (edges.length > 0) {
         setLatestPhoto(edges[0].node.image.uri);
-      } else {
-        setLatestPhoto(null);
       }
     } catch (error) {
       console.error('최근 사진을 불러오는데 실패했습니다.', error);
@@ -105,98 +87,83 @@ function CameraView({ onMediaCaptured }: CameraViewProps): React.JSX.Element {
 
   const handleGalleryPress = async () => {
     try {
-      if (Platform.OS === 'ios') {
-        await Linking.openURL('photos-redirect://');
-      } else if (Platform.OS === 'android') {
-        await Linking.openURL('content://media/external/images/media');
-      }
+      if (Platform.OS === 'ios') Linking.openURL('photos-redirect://');
+      else Linking.openURL('content://media/external/images/media');
     } catch (error) {
-      console.error('갤러리를 여는 데 실패했습니다:', error);
-      Alert.alert('오류', '갤러리 앱을 열 수 없습니다. 권한을 확인하거나 수동으로 열어주세요.');
+      Alert.alert('오류', '갤러리 앱을 열 수 없습니다.');
     }
   };
 
-  const convertImageToFloat32Array = async (imagePath: string): Promise<number[]> => {
-    // TODO: 실제 이미지 변환 로직 구현 예정
-    console.warn('convertImageToFloat32Array() 함수가 아직 구현되지 않았습니다.');
-    return new Array(3 * 256 * 256).fill(0.5);
+  const saveAndAnimate = async (imageUri: string, isBase64: boolean) => {
+    let finalUri = imageUri;
+    try {
+      if (isBase64) {
+        // Base64 데이터인 경우, 파일로 저장 후 갤러리에 추가
+        const tempPath = `${RNFS.CachesDirectoryPath}/processed_${new Date().getTime()}.png`;
+        await RNFS.writeFile(tempPath, imageUri.split(',')[1], 'base64');
+        finalUri = `file://${tempPath}`;
+      }
+      await CameraRoll.save(finalUri, { type: 'photo', album: 'NightLens' });
+      await fetchLatestPhoto(); // 갤러리 아이콘 업데이트
+
+      // 애니메이션 시작
+      setAnimatingImage({ uri: finalUri });
+      animatedValue.setValue(0); // 애니메이션 값 초기화
+
+      Animated.timing(animatedValue, {
+        toValue: 1,
+        duration: 800, // 애니메이션 지속 시간
+        useNativeDriver: true,
+      }).start(() => {
+        setAnimatingImage(null); // 애니메이션 종료 후 이미지 숨김
+      });
+
+    } catch (e: any) {
+      Alert.alert('저장 오류', '처리된 사진을 저장하는 데 실패했습니다.');
+      console.error('Save failed:', e);
+    }
   };
 
   const onTakePhoto = async () => {
-    if (camera.current == null) return;
+    if (camera.current == null || isLoading) return;
 
-    // 플래시 효과 시작
-    Animated.timing(flashOpacity, {
-      toValue: 0.8, // 불투명도를 0.8로 설정 (완전 흰색보다 부드럽게)
-      duration: 100, // 빠르게 깜빡이도록 시간 설정
-      useNativeDriver: true,
-    }).start(() => {
-      Animated.timing(flashOpacity, {
-        toValue: 0,
-        duration: 200, // 서서히 사라지도록 설정
-        useNativeDriver: true,
-      }).start();
-    });
+    Animated.sequence([
+      Animated.timing(flashOpacity, { toValue: 0.8, duration: 100, useNativeDriver: true }),
+      Animated.timing(flashOpacity, { toValue: 0, duration: 200, useNativeDriver: true }),
+    ]).start();
 
     try {
-      const photo = await camera.current.takePhoto({
-        flash: 'off',
-        // lowLightBoost: isNightModeEnabled, 
-      });
+      const photo = await camera.current.takePhoto({ flash: 'off' });
       const path = `file://${photo.path}`;
-      
-      await CameraRoll.save(path, { type: 'photo', album: 'NightLens' });
-      
-      fetchLatestPhoto();
 
-       // 1) 이미지 파일을 float32 배열로 변환하는 함수 호출 (아래에서 구현 예정)
-      const float32ImageData = await convertImageToFloat32Array(path);
-
-      // 여기서 네이티브 모듈 확인 로그 찍기
-      console.log('IATModelModule:', IATModelModule);
-      console.log('runInference 함수 타입:', typeof IATModelModule.runInference);
-      
-      // 2) Native 모듈로 추론 실행
-      const inferenceResult = await IATModelModule.runInference(float32ImageData);
-      console.log('추론 결과:', inferenceResult);
-
-      // 야간 모드가 활성화된 경우에만 변환 인디케이터 표시
       if (isNightModeEnabled) {
-        setIsConverting(true);
-        setTimeout(() => {
-          setIsConverting(false);
-        }, 5000); // 5초 동안 표시
+        setIsLoading(true);
+        const imageBase64 = await RNFS.readFile(photo.path, 'base64');
+        const resultBase64 = await IATModelModule.runModelOnImage(imageBase64);
+        const finalUri = `data:image/png;base64,${resultBase64}`;
+        await saveAndAnimate(finalUri, true);
+      } else {
+        await saveAndAnimate(path, false);
       }
-
-    } catch (e) {
-      console.error('사진 촬영 또는 저장 실패: ', e);
+    } catch (e: any) {
+      console.error('사진 처리 실패: ', e);
       Alert.alert('오류', '사진을 처리하는 중 오류가 발생했습니다.');
+    } finally {
+      setIsLoading(false);
     }
   };
-
-  const onStartRecording = async () => {
+  
+  const onStartRecording = () => { 
     if (camera.current == null) return;
     setIsRecording(true);
     camera.current.startRecording({
       onRecordingFinished: async (video) => {
         setIsRecording(false);
         const path = `file://${video.path}`;
-        
         try {
           await CameraRoll.save(path, { type: 'video', album: 'NightLens' });
-          
-          fetchLatestPhoto(); // 영상 촬영 후 최근 사진 업데이트 (썸네일용)
-
-          // 야간 모드가 활성화된 경우에만 변환 인디케이터 표시
-          if (isNightModeEnabled) {
-            setIsConverting(true);
-            setTimeout(() => {
-              setIsConverting(false);
-            }, 5000); // 5초 동안 표시
-          }
-
+          fetchLatestPhoto();
         } catch (error) {
-          console.error('영상 저장 실패: ', error);
           Alert.alert('오류', '영상을 저장하는 중 오류가 발생했습니다.');
         }
       },
@@ -206,8 +173,7 @@ function CameraView({ onMediaCaptured }: CameraViewProps): React.JSX.Element {
       },
     });
   };
-
-  const onStopRecording = async () => {
+  const onStopRecording = async () => { 
     if (camera.current == null) return;
     try {
       await camera.current.stopRecording();
@@ -215,10 +181,52 @@ function CameraView({ onMediaCaptured }: CameraViewProps): React.JSX.Element {
       console.error('녹화 중지 실패: ', e);
     }
   };
-
   const onFlipCamera = () => setDevicePosition(p => (p === 'back' ? 'front' : 'back'));
-  const toggleCaptureMode = () => setCaptureMode(m => (m === 'photo' ? 'video' : 'photo')); // 다시 활성화
+  const toggleCaptureMode = () => setCaptureMode(m => (m === 'photo' ? 'video' : 'photo'));
   const toggleSettings = () => setIsSettingsVisible(prev => !prev);
+
+  // 갤러리 아이콘의 위치를 저장하는 함수
+  const onGalleryLayout = (event: LayoutChangeEvent) => {
+    // onLayout 이벤트는 렌더링 시점에 여러 번 발생할 수 있으므로,
+    // galleryIconLayout의 위치를 한 번만 측정하도록 조건을 추가할 수 있습니다.
+    // 여기서는 단순화를 위해 매번 업데이트하도록 둡니다.
+    const { x, y, width, height } = event.nativeEvent.layout;
+    // 전체 화면 기준의 절대 좌표를 얻기 위해 `measure`를 사용하는 것이 더 정확할 수 있습니다.
+    // 이 예제에서는 부모 View 내의 상대적 위치를 사용합니다.
+    setGalleryIconLayout({ x, y, width, height });
+  };
+
+  // 애니메이션 스타일 계산
+  const animatedImageStyle = {
+    // 애니메이션 스타일은 화면 중앙에서 시작하여 갤러리 아이콘 위치로 이동하도록 계산됩니다.
+    // `absoluteFill`을 사용하므로 초기 위치는 (0,0)이지만, scale: 1로 전체 화면을 채웁니다.
+    // translateX, translateY는 화면 중앙을 기준으로 계산하는 것이 더 정확한 애니메이션을 만듭니다.
+    // 여기서는 단순화된 계산을 사용합니다.
+    transform: [
+      {
+        translateX: animatedValue.interpolate({
+          inputRange: [0, 1],
+          outputRange: [0, galleryIconLayout.x],
+        }),
+      },
+      {
+        translateY: animatedValue.interpolate({
+          inputRange: [0, 1],
+          outputRange: [0, galleryIconLayout.y],
+        }),
+      },
+      {
+        scale: animatedValue.interpolate({
+          inputRange: [0, 0.5, 1],
+          outputRange: [1, 1, 0.1], // 처음엔 크기 유지하다가 마지막에 작아짐
+        }),
+      },
+    ],
+    opacity: animatedValue.interpolate({
+      inputRange: [0, 0.8, 1],
+      outputRange: [1, 1, 0], // 마지막에 사라짐
+    }),
+  };
 
   if (device == null) return <View style={styles.container}><Text style={styles.text}>카메라를 찾을 수 없습니다.</Text></View>;
 
@@ -234,17 +242,21 @@ function CameraView({ onMediaCaptured }: CameraViewProps): React.JSX.Element {
         audio={captureMode === 'video'}
       />
 
-      {/* 사진 촬영 시 깜빡이는 효과를 위한 오버레이 */}
-      <Animated.View
-        style={[styles.flashOverlay, { opacity: flashOpacity }]}
-        pointerEvents="none" // 이 줄을 추가하여 터치 이벤트를 통과시킵니다.
-      />
+      <Animated.View style={[styles.flashOverlay, { opacity: flashOpacity }]} pointerEvents="none" />
 
-      {/* 변환 중 인디케이터 */}
-      {isConverting && (
-        <View style={styles.convertingIndicator}>
-          <Text style={styles.convertingText}>변환 중...</Text>
+      {isLoading && (
+        <View style={styles.loadingIndicator}>
+          <ActivityIndicator size="large" color="white" />
+          <Text style={styles.loadingText}>이미지 개선 중...</Text>
         </View>
+      )}
+
+      {/* ❗️ 애니메이션을 위한 이미지 뷰 */}
+      {animatingImage && (
+        <Animated.Image
+          source={{ uri: animatingImage.uri }}
+          style={[styles.animatedImage, animatedImageStyle]}
+        />
       )}
 
       {/* 상단 버튼 (플러스, 설정) */}
@@ -261,8 +273,6 @@ function CameraView({ onMediaCaptured }: CameraViewProps): React.JSX.Element {
           </Svg>
         </TouchableOpacity>
       </View>
-
-      {/* 설정 모달 */}
       {isSettingsVisible && (
         <View style={styles.settingsContainer}>
             <View style={styles.settingsRow}>
@@ -286,39 +296,35 @@ function CameraView({ onMediaCaptured }: CameraViewProps): React.JSX.Element {
         </View>
       )}
 
-      {/* 하단 버튼 (갤러리, 촬영, 전환) */}
+
       <View style={styles.bottomButtonsContainer}>
-        <TouchableOpacity style={styles.galleryButton} onPress={handleGalleryPress}>
+        {/* ❗️ onLayout 이벤트 핸들러 추가 */}
+        <TouchableOpacity style={styles.galleryButton} onPress={handleGalleryPress} onLayout={onGalleryLayout}>
           {latestPhoto ? (
             <Image source={{ uri: latestPhoto }} style={styles.galleryImage} />
           ) : (
-            <Text style={styles.galleryPlaceholderText}>No Photo</Text>
+            <View style={styles.galleryPlaceholder} />
           )}
         </TouchableOpacity>
 
         <View style={styles.captureCluster}>
           <TouchableOpacity
-            style={[
-              styles.captureButton,
-              isNightModeEnabled && styles.nightModeCaptureButton,
-            ]}
+            style={[ styles.captureButton, isNightModeEnabled && styles.nightModeCaptureButton ]}
             onPress={captureMode === 'photo' ? onTakePhoto : (isRecording ? onStopRecording : onStartRecording)}
           >
             {isRecording ? <View style={styles.stopIcon} /> : <View style={styles.photoIcon} />}
           </TouchableOpacity>
-          {/* 모드 전환 버튼을 다시 TouchableOpacity로 변경 */}
           <TouchableOpacity onPress={toggleCaptureMode} style={styles.modeSwitchButton}>
             <Text style={styles.buttonText}>{captureMode === 'photo' ? '사진' : '비디오'}</Text>
           </TouchableOpacity>
         </View>
-
         <TouchableOpacity style={styles.iconButton} onPress={onFlipCamera}>
-           <Svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <Path d="M17 2l4 4-4 4" />
-            <Path d="M3 11v-1a4 4 0 0 1 4-4h14" />
-            <Path d="M7 22l-4-4 4-4" />
-            <Path d="M21 13v1a4 4 0 0 1-4 4H3" />
-          </Svg>
+            <Svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <Path d="M17 2l4 4-4 4" />
+                <Path d="M3 11v-1a4 4 0 0 1 4-4h14" />
+                <Path d="M7 22l-4-4 4-4" />
+                <Path d="M21 13v1a4 4 0 0 1-4 4H3" />
+            </Svg>
         </TouchableOpacity>
       </View>
     </View>
@@ -326,141 +332,34 @@ function CameraView({ onMediaCaptured }: CameraViewProps): React.JSX.Element {
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1 },
-  text: { color: 'white', fontSize: 18 },
-  topButtonsContainer: {
+  container: { flex: 1, backgroundColor: 'black' },
+  text: { color: 'white', fontSize: 18, textAlign: 'center' },
+  topButtonsContainer: { position: 'absolute', top: 60, left: 20, right: 20, flexDirection: 'row', justifyContent: 'space-between' },
+  bottomButtonsContainer: { position: 'absolute', bottom: 40, width: '100%', flexDirection: 'row', justifyContent: 'space-around', alignItems: 'center' },
+  iconButton: { padding: 10, backgroundColor: 'rgba(0,0,0,0.3)', borderRadius: 30 },
+  galleryButton: { width: 50, height: 50, borderRadius: 10, borderWidth: 1, borderColor: 'white', justifyContent: 'center', alignItems: 'center', overflow: 'hidden' },
+  galleryImage: { width: '100%', height: '100%' },
+  galleryPlaceholder: { width: '100%', height: '100%', backgroundColor: 'rgba(255,255,255,0.2)' },
+  captureCluster: { alignItems: 'center' },
+  captureButton: { width: 70, height: 70, borderRadius: 35, backgroundColor: 'rgba(255, 255, 255, 0.9)', justifyContent: 'center', alignItems: 'center', borderWidth: 4, borderColor: 'rgba(0,0,0,0.2)' },
+  nightModeCaptureButton: { borderColor: '#81b0ff', borderWidth: 4, shadowColor: '#81b0ff', shadowOffset: { width: 0, height: 0 }, shadowOpacity: 0.9, shadowRadius: 8, elevation: 10 },
+  photoIcon: { width: 60, height: 60, borderRadius: 30, backgroundColor: 'white' },
+  stopIcon: { width: 30, height: 30, borderRadius: 6, backgroundColor: 'red' },
+  modeSwitchButton: { marginTop: 10, backgroundColor: 'rgba(0,0,0,0.5)', paddingVertical: 5, paddingHorizontal: 15, borderRadius: 20 },
+  buttonText: { color: 'white', fontSize: 14, fontWeight: 'bold' },
+  settingsContainer: { position: 'absolute', top: 120, alignSelf: 'center', width: '85%', backgroundColor: 'rgba(0,0,0,0.7)', borderRadius: 20, padding: 20, elevation: 5 },
+  settingsRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 10 },
+  settingsText: { fontSize: 16, color: 'white' },
+  flashOverlay: { ...StyleSheet.absoluteFillObject, backgroundColor: 'white', zIndex: 10 },
+  loadingIndicator: { position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(0,0,0,0.5)', zIndex: 20 },
+  loadingText: { color: 'white', fontSize: 18, fontWeight: 'bold', marginTop: 10 },
+  animatedImage: {
     position: 'absolute',
-    top: 60,
-    left: 20,
-    right: 20,
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-  },
-  bottomButtonsContainer: {
-    position: 'absolute',
-    bottom: 40,
-    width: '100%',
-    flexDirection: 'row',
-    justifyContent: 'space-around',
-    alignItems: 'center',
-  },
-  iconButton: {
-    padding: 10,
-    backgroundColor: 'rgba(0,0,0,0.3)',
-    borderRadius: 30,
-  },
-  galleryButton: {
-    width: 50,
-    height: 50,
-    borderRadius: 10,
-    backgroundColor: 'rgba(255,255,255,0.2)',
-    borderWidth: 1,
-    borderColor: 'white',
-    justifyContent: 'center',
-    alignItems: 'center',
-    overflow: 'hidden',
-  },
-  galleryImage: {
-    width: '100%',
-    height: '100%',
-  },
-  galleryPlaceholderText: {
-    color: 'white',
-    fontSize: 10,
-    textAlign: 'center',
-  },
-  captureCluster: {
-    alignItems: 'center',
-  },
-  captureButton: {
-    width: 70,
-    height: 70,
-    borderRadius: 35,
-    backgroundColor: 'rgba(255, 255, 255, 0.9)',
-    justifyContent: 'center',
-    alignItems: 'center',
-    borderWidth: 4,
-    borderColor: 'rgba(0,0,0,0.2)',
-  },
-  nightModeCaptureButton: {
-    borderColor: '#00FF00',
-    borderWidth: 5,
-    shadowColor: '#00FF00',
-    shadowOffset: { width: 0, height: 0 },
-    shadowOpacity: 1,
-    shadowRadius: 10,
-    elevation: 10,
-  },
-  photoIcon: {
-    width: 60,
-    height: 60,
-    borderRadius: 30,
-    backgroundColor: 'white',
-  },
-  stopIcon: {
-    width: 30,
-    height: 30,
-    borderRadius: 6,
-    backgroundColor: 'red',
-  },
-  // 모드 전환 버튼 스타일을 다시 정의합니다.
-  modeSwitchButton: {
-    marginTop: 10,
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    paddingVertical: 5,
-    paddingHorizontal: 15,
-    borderRadius: 20,
-  },
-  buttonText: {
-    color: 'white',
-    fontSize: 14,
-    fontWeight: 'bold',
-  },
-  settingsContainer: {
-    position: 'absolute',
-    top: 120,
-    alignSelf: 'center',
-    width: '85%',
-    backgroundColor: 'white',
-    borderRadius: 20,
-    padding: 20,
-    elevation: 5,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.25,
-    shadowRadius: 3.84,
-  },
-  settingsRow: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    paddingVertical: 10,
-  },
-  settingsText: {
-    fontSize: 16,
-    color: 'black',
-  },
-  flashOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: 'white',
-    zIndex: 10,
-  },
-  // 변환 중 인디케이터 스타일 추가
-  convertingIndicator: {
-    position: 'absolute',
-    top: '50%',
-    left: '50%',
-    transform: [{ translateX: -75 }, { translateY: -25 }], // 중앙 정렬
-    backgroundColor: 'rgba(0,0,0,0.7)',
-    paddingVertical: 15,
-    paddingHorizontal: 30,
-    borderRadius: 10,
-    zIndex: 20, // 다른 UI 위에 오도록 zIndex 설정
-  },
-  convertingText: {
-    color: 'white',
-    fontSize: 18,
-    fontWeight: 'bold',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    resizeMode: 'contain',
   },
 });
 
