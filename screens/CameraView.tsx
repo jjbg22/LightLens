@@ -21,6 +21,9 @@ import {
   useCameraPermission,
 } from 'react-native-vision-camera';
 import { Svg, Path, Circle } from 'react-native-svg';
+import { NativeModules } from 'react-native';
+
+const { IATModelModule } = NativeModules;
 
 interface CameraViewProps {
   onMediaCaptured: (media: { path: string; type: 'photo' | 'video' }) => void;
@@ -113,6 +116,12 @@ function CameraView({ onMediaCaptured }: CameraViewProps): React.JSX.Element {
     }
   };
 
+  const convertImageToFloat32Array = async (imagePath: string): Promise<number[]> => {
+    // TODO: 실제 이미지 변환 로직 구현 예정
+    console.warn('convertImageToFloat32Array() 함수가 아직 구현되지 않았습니다.');
+    return new Array(3 * 256 * 256).fill(0.5);
+  };
+
   const onTakePhoto = async () => {
     if (camera.current == null) return;
 
@@ -132,13 +141,24 @@ function CameraView({ onMediaCaptured }: CameraViewProps): React.JSX.Element {
     try {
       const photo = await camera.current.takePhoto({
         flash: 'off',
-        lowLightBoost: isNightModeEnabled,
+        // lowLightBoost: isNightModeEnabled, 
       });
       const path = `file://${photo.path}`;
       
       await CameraRoll.save(path, { type: 'photo', album: 'NightLens' });
       
       fetchLatestPhoto();
+
+       // 1) 이미지 파일을 float32 배열로 변환하는 함수 호출 (아래에서 구현 예정)
+      const float32ImageData = await convertImageToFloat32Array(path);
+
+      // 여기서 네이티브 모듈 확인 로그 찍기
+      console.log('IATModelModule:', IATModelModule);
+      console.log('runInference 함수 타입:', typeof IATModelModule.runInference);
+      
+      // 2) Native 모듈로 추론 실행
+      const inferenceResult = await IATModelModule.runInference(float32ImageData);
+      console.log('추론 결과:', inferenceResult);
 
       // 야간 모드가 활성화된 경우에만 변환 인디케이터 표시
       if (isNightModeEnabled) {
