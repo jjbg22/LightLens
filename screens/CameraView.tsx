@@ -23,6 +23,8 @@ import {
 import { Svg, Path, Circle } from 'react-native-svg';
 import { NativeModules } from 'react-native';
 import RNFS from 'react-native-fs';
+import { launchImageLibrary } from 'react-native-image-picker';
+
 
 const { IATModelModule } = NativeModules;
 
@@ -124,6 +126,24 @@ function CameraView(): React.JSX.Element {
     }
   };
 
+  const processImage = async (imagePath: string) => {
+    if (isLoading) return;
+    setIsLoading(true);
+    try {
+      // 이미지 경로에서 'file://' 접두사를 제거해야 RNFS가 제대로 파일을 읽을 수 있습니다.
+      const cleanedPath = imagePath.startsWith('file://') ? imagePath.substring(7) : imagePath;
+      const imageBase64 = await RNFS.readFile(cleanedPath, 'base64');
+      const resultBase64 = await IATModelModule.runModelOnImage(imageBase64);
+      const finalUri = `data:image/png;base64,${resultBase64}`;
+      await saveAndAnimate(finalUri, true);
+    } catch (e: any) {
+      console.error('이미지 처리 실패: ', e);
+      Alert.alert('오류', '이미지를 처리하는 중 오류가 발생했습니다.');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   const onTakePhoto = async () => {
     if (camera.current == null || isLoading) return;
 
@@ -137,19 +157,38 @@ function CameraView(): React.JSX.Element {
       const path = `file://${photo.path}`;
 
       if (isNightModeEnabled) {
-        setIsLoading(true);
-        const imageBase64 = await RNFS.readFile(photo.path, 'base64');
-        const resultBase64 = await IATModelModule.runModelOnImage(imageBase64);
-        const finalUri = `data:image/png;base64,${resultBase64}`;
-        await saveAndAnimate(finalUri, true);
+        await processImage(path);
       } else {
         await saveAndAnimate(path, false);
       }
     } catch (e: any) {
       console.error('사진 처리 실패: ', e);
       Alert.alert('오류', '사진을 처리하는 중 오류가 발생했습니다.');
-    } finally {
       setIsLoading(false);
+    } 
+  };
+
+  const handleSelectAndProcessImage = async () => {
+    const response = await launchImageLibrary({
+      mediaType: 'photo',
+      selectionLimit: 1, // 한 장만 선택
+    });
+
+    if (response.didCancel) {
+      console.log('User cancelled image picker');
+    } else if (response.errorCode) {
+      Alert.alert('ImagePicker Error: ', response.errorMessage);
+    } else if (response.assets && response.assets[0].uri) {
+      const imageUri = response.assets[0].uri;
+      // Night Enhancement Mode가 켜져 있을 때만 변환을 실행합니다.
+      if (isNightModeEnabled) {
+        await processImage(imageUri);
+      } else {
+        // 모드가 꺼져있으면 갤러리에서 선택만 하고 별도 처리는 하지 않거나,
+        // 혹은 원본을 그대로 앨범에 복사/저장하는 등의 처리를 할 수 있습니다.
+        // 여기서는 모드가 켜져 있을 때만 동작하도록 합니다.
+        Alert.alert("알림", "Night Enhancement Mode가 켜져 있을 때만 변환이 가능합니다.");
+      }
     }
   };
   
@@ -261,7 +300,7 @@ function CameraView(): React.JSX.Element {
 
       {/* 상단 버튼 (플러스, 설정) */}
       <View style={styles.topButtonsContainer}>
-        <TouchableOpacity style={styles.iconButton}>
+        <TouchableOpacity style={styles.iconButton}  onPress={handleSelectAndProcessImage}>
           <Svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
             <Path d="M12 5v14M5 12h14" />
           </Svg>
