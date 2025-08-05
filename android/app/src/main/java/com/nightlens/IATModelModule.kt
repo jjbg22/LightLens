@@ -9,14 +9,22 @@ import kotlinx.coroutines.*
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import org.tensorflow.lite.Interpreter
+import org.tensorflow.lite.flex.FlexDelegate
 import java.io.FileInputStream
 import java.nio.channels.FileChannel
+import android.util.Log
+import android.graphics.Matrix
+import android.media.ExifInterface
+import java.io.File
+
+
 
 @ReactModule(name = IATModelModule.NAME)
 class IATModelModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext), LifecycleEventListener {
 
     private var interpreter: Interpreter? = null
+    private var flexDelegate: FlexDelegate? = null
     private var dataConverter: IATModelLoader? = null
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
@@ -44,9 +52,14 @@ class IATModelModule(private val reactContext: ReactApplicationContext) :
             val declaredLength = assetFileDescriptor.declaredLength
             val modelBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, startOffset, declaredLength)
 
-            interpreter = Interpreter(modelBuffer)
-            dataConverter = IATModelLoader()
-            
+            flexDelegate = FlexDelegate()
+            val options = Interpreter.Options().addDelegate(flexDelegate)
+
+            interpreter = Interpreter(modelBuffer, options)
+
+            // IATModelLoader 생성 시 Context 인자가 필요하니까 전달해 줘야 해
+            dataConverter = IATModelLoader(reactContext)
+
             promise.resolve("Model initialized successfully")
         } catch (e: Exception) {
             promise.reject("MODEL_INIT_FAILED", e.message, e)
@@ -64,12 +77,33 @@ class IATModelModule(private val reactContext: ReactApplicationContext) :
             try {
                 val inputBytes = Base64.decode(base64Input, Base64.DEFAULT)
                 val inputBitmap = BitmapFactory.decodeByteArray(inputBytes, 0, inputBytes.size)
-                val inputBuffer = dataConverter!!.convertBitmapToByteBuffer(inputBitmap)
-                val outputBuffer = ByteBuffer.allocateDirect(1 * 256 * 256 * 3 * 4).order(ByteOrder.nativeOrder())
+                val rotatedBitmap = rotateBitmapIfRequired(inputBitmap, inputBytes)
+                val inputBuffer = dataConverter!!.convertBitmapToByteBuffer(rotatedBitmap)
+
+                val outputShape = interpreter!!.getOutputTensor(1).shape()
+                val outputDataType = interpreter!!.getOutputTensor(1).dataType()
+
+                Log.d("IATModel", "Output tensor shape: ${outputShape.joinToString(", ")}")
+                Log.d("IATModel", "Output tensor dtype: $outputDataType")
+
+
+                val outputChannels = outputShape[1]  // 3
+                val outputHeight = outputShape[2]    // 256
+                val outputWidth = outputShape[3]     // 256
+
+                // float = 4 bytes
+                val outputBufferSize = 1 * outputHeight * outputWidth * outputChannels * 4
+
+                val outputBuffer = ByteBuffer.allocateDirect(outputBufferSize).order(ByteOrder.nativeOrder())
+
+                outputBuffer.rewind()
 
                 interpreter!!.run(inputBuffer, outputBuffer)
+                outputBuffer.rewind()
 
-                val outputBitmap = dataConverter!!.convertByteBufferToBitmap(outputBuffer, 256, 256)
+                val outputBitmap = dataConverter!!.convertByteBufferToBitmap(outputBuffer, outputWidth, outputHeight)
+
+
                 val outputStream = java.io.ByteArrayOutputStream()
                 outputBitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
                 val outputBase64 = Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
@@ -85,17 +119,40 @@ class IATModelModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    // ❗️ 아래 함수들이 누락되어 있었습니다.
+    private fun rotateBitmapIfRequired(bitmap: Bitmap, imageBytes: ByteArray): Bitmap {
+        return try {
+            // 임시 파일로 저장
+            val tempFile = File.createTempFile("temp_image", ".jpg", reactContext.cacheDir)
+            tempFile.writeBytes(imageBytes)
+
+            val exif = ExifInterface(tempFile.absolutePath)
+            val orientation = exif.getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)
+            val matrix = Matrix()
+
+            when (orientation) {
+                ExifInterface.ORIENTATION_ROTATE_90 -> matrix.postRotate(90f)
+                ExifInterface.ORIENTATION_ROTATE_180 -> matrix.postRotate(180f)
+                ExifInterface.ORIENTATION_ROTATE_270 -> matrix.postRotate(270f)
+            }
+
+            if (matrix.isIdentity) bitmap else Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+        } catch (e: Exception) {
+            bitmap
+        }
+    }
+
+
     override fun onHostResume() {
-        // 필수 구현 (내용은 없어도 됨)
+        // 빈 구현
     }
 
     override fun onHostPause() {
-        // 필수 구현 (내용은 없어도 됨)
+        // 빈 구현
     }
 
     override fun onHostDestroy() {
         interpreter?.close()
+        flexDelegate?.close()
         scope.cancel()
         reactContext.removeLifecycleEventListener(this)
     }
@@ -103,6 +160,7 @@ class IATModelModule(private val reactContext: ReactApplicationContext) :
     override fun invalidate() {
         super.invalidate()
         interpreter?.close()
+        flexDelegate?.close()
         scope.cancel()
     }
 }
