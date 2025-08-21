@@ -1,0 +1,16 @@
+apply plugin: 'com.android.library' // 라이브러리 모듈로 인식시키기
+
+android {
+    compileSdkVersion rootProject.ext.compileSdkVersion  // 루트 gradle에서 가져오기
+
+    defaultConfig {
+        minSdkVersion rootProject.ext.minSdkVersion      // 루트 gradle 기준
+        targetSdkVersion rootProject.ext.targetSdkVersion
+    }
+
+    namespace "org.opencv"  // 패키지 이름. 자유롭게 지정 가능
+}
+
+dependencies {
+    // 필요하면 여기에 다른 라이브러리 추가 가능
+}

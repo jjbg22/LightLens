@@ -26,6 +26,7 @@ import RNFS from 'react-native-fs';
 import { launchImageLibrary } from 'react-native-image-picker';
 
 
+
 const { IATModelModule } = NativeModules;
 
 // 이제 이 컴포넌트는 독립적으로 동작하므로 props가 필요 없습니다.
@@ -50,6 +51,7 @@ function CameraView(): React.JSX.Element {
   const [animatingImage, setAnimatingImage] = useState<{ uri: string } | null>(null);
   const animatedValue = useRef(new Animated.Value(0)).current;
   const [galleryIconLayout, setGalleryIconLayout] = useState({ x: 0, y: 0, width: 0, height: 0 });
+
 
   useEffect(() => {
     if (!hasPermission) {
@@ -193,33 +195,61 @@ function CameraView(): React.JSX.Element {
   };
   
   const onStartRecording = () => { 
-    if (camera.current == null) return;
-    setIsRecording(true);
-    camera.current.startRecording({
-      onRecordingFinished: async (video) => {
-        setIsRecording(false);
-        const path = `file://${video.path}`;
+  if (camera.current == null) return;
+  setIsRecording(true);
+
+  camera.current.startRecording({
+    onRecordingFinished: async (video: { path: string }) => {
+      setIsRecording(false);
+      const inputPath = `file://${video.path}`;
+      const outputPath = `${RNFS.CachesDirectoryPath}/enhanced_${Date.now()}.mp4`;
+
+      if (isNightModeEnabled) {
+        setIsLoading(true); // 로딩 표시 시작
         try {
-          await CameraRoll.save(path, { type: 'video', album: 'NightLens' });
-          fetchLatestPhoto();
-        } catch (error) {
+          // Native Module에서 안전하게 비디오 처리
+          await IATModelModule.runModelOnVideo(inputPath, outputPath);
+          await CameraRoll.save(outputPath, { type: 'video', album: 'NightLens' });
+        } catch (e: any) {
+          console.error('Night Mode 비디오 처리 실패:', e);
+          Alert.alert('오류', '비디오를 처리하는 중 오류가 발생했습니다.');
+        } finally {
+          setIsLoading(false); // 로딩 종료
+        }
+      } else {
+        // Night Mode 꺼진 경우 원본 저장
+        try {
+          await CameraRoll.save(inputPath, { type: 'video', album: 'NightLens' });
+        } catch (e) {
+          console.error('원본 저장 실패:', e);
           Alert.alert('오류', '영상을 저장하는 중 오류가 발생했습니다.');
         }
-      },
-      onRecordingError: (error) => {
-        console.error('녹화 오류: ', error);
-        setIsRecording(false);
-      },
-    });
-  };
-  const onStopRecording = async () => { 
-    if (camera.current == null) return;
-    try {
-      await camera.current.stopRecording();
-    } catch (e) {
-      console.error('녹화 중지 실패: ', e);
-    }
-  };
+      }
+
+      fetchLatestPhoto(); // 갤러리 최신 사진/영상 업데이트
+    },
+    onRecordingError: (error: unknown) => {
+      console.error('녹화 오류: ', error);
+      setIsRecording(false);
+      Alert.alert('오류', '녹화 중 오류가 발생했습니다.');
+    },
+  });
+};
+
+const onStopRecording = () => { 
+  if (camera.current == null) return;
+
+  try {
+    camera.current.stopRecording(); // 반환값 사용 안 함, Native에서 처리
+  } catch (e) {
+    console.error('녹화 중지 실패:', e);
+    setIsRecording(false);
+    Alert.alert('오류', '녹화 중지 중 오류가 발생했습니다.');
+  }
+};
+
+
+
   const onFlipCamera = () => setDevicePosition(p => (p === 'back' ? 'front' : 'back'));
   const toggleCaptureMode = () => setCaptureMode(m => (m === 'photo' ? 'video' : 'photo'));
   const toggleSettings = () => setIsSettingsVisible(prev => !prev);
@@ -267,6 +297,7 @@ function CameraView(): React.JSX.Element {
     }),
   };
 
+
   if (device == null) return <View style={styles.container}><Text style={styles.text}>카메라를 찾을 수 없습니다.</Text></View>;
 
   return (
@@ -279,6 +310,7 @@ function CameraView(): React.JSX.Element {
         photo={captureMode === 'photo'}
         video={captureMode === 'video'}
         audio={captureMode === 'video'}
+
       />
 
       <Animated.View style={[styles.flashOverlay, { opacity: flashOpacity }]} pointerEvents="none" />

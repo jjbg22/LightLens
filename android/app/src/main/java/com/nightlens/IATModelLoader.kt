@@ -94,13 +94,30 @@ class IATModelLoader(context: Context, modelFileName: String = "IAT.tflite") {
     }
 
     // 모델 추론 함수 (입출력 포맷에 맞게 조정 필요)
-    fun runInference(inputBuffer: ByteBuffer): ByteBuffer {
+    fun runInferenceWithLogging(bitmap: Bitmap): Pair<ByteBuffer, Long> {
+        val startTime = System.currentTimeMillis()
+
+        // 1. Preprocessing
+        Log.d("IATTimer", "Start preprocessing")
+        val inputBuffer = convertBitmapToByteBuffer(bitmap)
+        val preProcessEnd = System.currentTimeMillis()
+        Log.d("IATTimer", "Preprocessing time: ${preProcessEnd - startTime} ms")
+
+        // 2. Inference
+        Log.d("IATTimer", "Start inference")
         val outputBuffer = ByteBuffer.allocateDirect(1 * 256 * 256 * 3 * 4)
         outputBuffer.order(ByteOrder.nativeOrder())
         interpreter.run(inputBuffer, outputBuffer)
+        val inferenceEnd = System.currentTimeMillis()
+        Log.d("IATTimer", "Inference time: ${inferenceEnd - preProcessEnd} ms")
+
+        val totalTime = inferenceEnd - startTime
+        Log.d("IATTimer", "Total time: $totalTime ms")
+
         outputBuffer.rewind()
-        return outputBuffer
+        return Pair(outputBuffer, totalTime)
     }
+
 
     // 필요시 interpreter close 함수 추가
     fun close() {

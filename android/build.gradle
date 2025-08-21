@@ -5,17 +5,22 @@ buildscript {
         compileSdkVersion = 34
         targetSdkVersion = 34
         ndkVersion = "26.1.10909125"
-        kotlinVersion = "1.9.22"
+        kotlinVersion = "1.8.22"
     }
     repositories {
         google()
         mavenCentral()
+        maven { url "https://jitpack.io" } // OpenCV 모듈용
     }
     dependencies {
-        classpath("com.android.tools.build:gradle")
-        classpath("com.facebook.react:react-native-gradle-plugin")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin")
+        // Gradle Plugin 명시적 버전 지정
+        classpath("com.android.tools.build:gradle:8.1.1")
+        classpath("com.facebook.react:react-native-gradle-plugin:0.9.5")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:1.8.22")
+
     }
 }
 
-apply plugin: "com.facebook.react.rootproject"
+
+
+
