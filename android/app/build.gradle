@@ -1,6 +1,7 @@
 apply plugin: "com.android.application"
 apply plugin: "org.jetbrains.kotlin.android"
 apply plugin: "com.facebook.react"
+apply plugin: "kotlin-parcelize"
 
 /**
  * This is the configuration block to customize your React Native Android app.
@@ -73,17 +74,26 @@ android {
     ndkVersion rootProject.ext.ndkVersion
     buildToolsVersion rootProject.ext.buildToolsVersion
     compileSdk rootProject.ext.compileSdkVersion
-    ndkVersion rootProject.ext.ndkVersion
 
     namespace "com.nightlens"
 
     defaultConfig {
         applicationId "com.nightlens"
-        minSdkVersion 26
+        minSdkVersion 31
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "1.0"
+        ndk {
+            abiFilters 'armeabi-v7a', 'arm64-v8a'
+        }
     }
+
+    java {
+        toolchain {
+            languageVersion.set(JavaLanguageVersion.of(17))
+        }
+    }
+
     signingConfigs {
         debug {
             storeFile file('debug.keystore')
@@ -100,6 +110,7 @@ android {
             }
         }
     }
+
     buildTypes {
         debug {
             signingConfig signingConfigs.debug
@@ -115,11 +126,18 @@ android {
     sourceSets {
         main {
             assets.srcDirs = ['src/main/assets']
+            jniLibs.srcDirs = ['src/main/jniLibs']
         }
     }
+
     kotlinOptions {
+        jvmTarget = "17"
         allWarningsAsErrors = false
         freeCompilerArgs += ["-Xskip-prerelease-check"]
+    }
+
+    buildFeatures {
+        buildConfig true
     }
 
 }
@@ -141,6 +159,10 @@ dependencies {
     } else {
         implementation jscFlavor
     }
+
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3"
+    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3"
+
 }
 
 

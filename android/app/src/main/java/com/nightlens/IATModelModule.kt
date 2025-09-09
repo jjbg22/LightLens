@@ -16,16 +16,18 @@ import android.util.Log
 import android.graphics.Matrix
 import android.media.ExifInterface
 import java.io.File
-import android.media.MediaExtractor
-import android.media.MediaFormat
-import android.media.MediaCodec
-import android.media.MediaCodecInfo
 import android.media.Image
 import android.view.Surface
 import android.graphics.Canvas
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.ArrayBlockingQueue
-import android.media.MediaMuxer
+import org.opencv.android.OpenCVLoader
+import org.opencv.videoio.VideoCapture
+import org.opencv.imgproc.Imgproc
+import org.opencv.android.Utils
+import org.opencv.core.Mat
+import org.opencv.core.Size
+import org.opencv.videoio.VideoWriter
+import android.content.ContentValues
+import android.provider.MediaStore
 
 
 
@@ -48,7 +50,14 @@ class IATModelModule(private val reactContext: ReactApplicationContext) :
 
     override fun getName(): String = NAME
 
+
     init {
+        if (!OpenCVLoader.initDebug()) {
+            Log.e("OpenCV", "Unable to load OpenCV")
+        } else {
+            Log.d("OpenCV", "OpenCV loaded successfully")
+        }
+
         reactContext.addLifecycleEventListener(this)
     }
 
@@ -156,221 +165,92 @@ class IATModelModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
-    fun runModelOnVideo(inputPath: String, outputPath: String, promise: Promise) {
-        if (interpreter == null || dataConverter == null) {
+    fun runModelOnVideo(inputPath: String, promise: Promise) {
+        if (dataConverter == null || interpreter == null) {
             promise.reject("MODEL_NOT_INITIALIZED", "Call initializeModel() first.")
             return
         }
 
-        // --- 수정됨: EOS 더미 비트맵 정의 ---
-        val EOS = Bitmap.createBitmap(1, 1, Bitmap.Config.ARGB_8888)
-
         scope.launch(Dispatchers.IO) {
             try {
-                val extractor = MediaExtractor()
-                extractor.setDataSource(inputPath)
-                var videoTrackIndex = -1
-                for (i in 0 until extractor.trackCount) {
-                    val format = extractor.getTrackFormat(i)
-                    val mime = format.getString(MediaFormat.KEY_MIME)
-                    if (mime != null && mime.startsWith("video/")) {
-                        videoTrackIndex = i
-                        extractor.selectTrack(i)
-                        break
+                if (!OpenCVLoader.initDebug()) {
+                    withContext(Dispatchers.Main) {
+                        promise.reject("OPENCV_LOAD_FAILED", "OpenCV failed to load")
                     }
-                }
-                if (videoTrackIndex == -1) throw Exception("Video track not found")
-
-                val inputFormat = extractor.getTrackFormat(videoTrackIndex)
-                val width = inputFormat.getInteger(MediaFormat.KEY_WIDTH)
-                val height = inputFormat.getInteger(MediaFormat.KEY_HEIGHT)
-
-                val outputFormat = MediaFormat.createVideoFormat("video/avc", width, height).apply {
-                    setInteger(
-                        MediaFormat.KEY_COLOR_FORMAT,
-                        MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible
-                    )
-                    setInteger(MediaFormat.KEY_BIT_RATE, 4_000_000)
-                    setInteger(MediaFormat.KEY_FRAME_RATE, 30)
-                    setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                    return@launch
                 }
 
-                val encoder = MediaCodec.createEncoderByType("video/avc")
-                encoder.configure(outputFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-                encoder.start()
-
-                val decoder =
-                    MediaCodec.createDecoderByType(inputFormat.getString(MediaFormat.KEY_MIME)!!)
-                decoder.configure(inputFormat, null, null, 0)
-                decoder.start()
-
-                val frameQueue = LinkedBlockingQueue<Bitmap>(5)
-                val resultQueue = LinkedBlockingQueue<Bitmap>(5)
-                val bufferInfo = MediaCodec.BufferInfo()
-                var isEOS = false
-
-                // --- Decoder Job ---
-                val decoderJob = launch {
-                    try {
-                        while (!isEOS) {
-                            val inIndex = decoder.dequeueInputBuffer(10_000)
-                            if (inIndex >= 0) {
-                                val inputBuffer = decoder.getInputBuffer(inIndex)!!
-                                val sampleSize = extractor.readSampleData(inputBuffer, 0)
-                                if (sampleSize < 0) {
-                                    decoder.queueInputBuffer(
-                                        inIndex, 0, 0, 0,
-                                        MediaCodec.BUFFER_FLAG_END_OF_STREAM
-                                    )
-                                    isEOS = true
-                                } else {
-                                    decoder.queueInputBuffer(
-                                        inIndex, 0, sampleSize, extractor.sampleTime, 0
-                                    )
-                                    extractor.advance()
-                                }
-                            }
-
-                            val outIndex = decoder.dequeueOutputBuffer(bufferInfo, 10_000)
-                            if (outIndex >= 0) {
-                                val image = decoder.getOutputImage(outIndex)
-                                if (image != null) {
-                                    val bmp256 = Bitmap.createScaledBitmap(
-                                        convertYUVToBitmap(image),
-                                        256, 256, true
-                                    )
-                                    image.close()
-                                    // --- 수정됨: null 대신 EOS 사용 ---
-                                    if (!frameQueue.offer(bmp256)) {
-                                        frameQueue.poll()
-                                        frameQueue.offer(bmp256)
-                                    }
-                                }
-                                decoder.releaseOutputBuffer(outIndex, false)
-                            }
-                        }
-                        // --- 수정됨: EOS 신호 ---
-                        frameQueue.offer(EOS)
-                    } catch (e: Exception) {
-                        Log.e("runModelOnVideo", "Decoder error", e)
+                val cleanPath = inputPath.removePrefix("file://")
+                val file = File(cleanPath)
+                Log.d("VideoDebug", "InputPath=$inputPath, CleanPath=$cleanPath, Exists=${file.exists()}")
+                if (!file.exists()) {
+                    withContext(Dispatchers.Main) {
+                        promise.reject("VIDEO_FILE_NOT_FOUND", "Video file does not exist: $cleanPath")
                     }
+                    return@launch
                 }
 
-                // --- Inference Job ---
-                val inferenceJob = launch {
-                    try {
-                        while (true) {
-                            val inputFrame = frameQueue.take()
-                            // --- 수정됨: EOS 감지 시 종료 ---
-                            if (inputFrame == EOS) break
-
-                            val inputBuffer = dataConverter!!.convertBitmapToByteBuffer(inputFrame)
-                            val outputBuffer = ByteBuffer.allocateDirect(256 * 256 * 3 * 4)
-                                .order(ByteOrder.nativeOrder())
-                            interpreter!!.run(inputBuffer, outputBuffer)
-                            outputBuffer.rewind()
-                            val enhancedBitmap =
-                                dataConverter!!.convertByteBufferToBitmap(outputBuffer, 256, 256)
-                            if (!resultQueue.offer(enhancedBitmap)) {
-                                resultQueue.poll()
-                                resultQueue.offer(enhancedBitmap)
-                            }
-                        }
-                        // 종료 신호
-                        resultQueue.offer(EOS)
-                    } catch (e: Exception) {
-                        Log.e("runModelOnVideo", "Inference error", e)
+                val capture = VideoCapture(cleanPath)
+                if (!capture.isOpened) {
+                    withContext(Dispatchers.Main) {
+                        promise.reject("VIDEO_CAPTURE_FAILED", "Cannot open video: $cleanPath")
                     }
+                    return@launch
                 }
 
-                // --- Encoder + Muxer Job ---
-                val muxer = MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-                var trackIndex = -1
-                val encoderJob = launch {
-                    try {
-                        while (true) {
-                            val enhancedFrame = resultQueue.take()
-                            if (enhancedFrame == EOS) break
+                val fps = capture.get(org.opencv.videoio.Videoio.CAP_PROP_FPS)
+                val matFrame = org.opencv.core.Mat()
+                var writer: VideoWriter? = null
+                var tmpBitmap: Bitmap? = null
 
-                            val outputBitmap =
-                                Bitmap.createScaledBitmap(enhancedFrame, width, height, true)
-                            val yuvData = bitmapToNV12(outputBitmap)
-
-                            val inIndex = encoder.dequeueInputBuffer(10_000)
-                            if (inIndex >= 0) {
-                                val encBuffer = encoder.getInputBuffer(inIndex)!!
-                                encBuffer.clear()
-                                encBuffer.put(yuvData)
-                                encoder.queueInputBuffer(
-                                    inIndex,
-                                    0,
-                                    yuvData.size,
-                                    System.nanoTime() / 1000,
-                                    0
-                                )
-                            }
-
-                            // Encoder output
-                            var outIndex = encoder.dequeueOutputBuffer(bufferInfo, 10_000)
-                            while (outIndex >= 0) {
-                                if (trackIndex == -1) {
-                                    val format = encoder.outputFormat
-                                    trackIndex = muxer.addTrack(format)
-                                    muxer.start()
-                                }
-                                val encodedData = encoder.getOutputBuffer(outIndex)!!
-                                muxer.writeSampleData(trackIndex, encodedData, bufferInfo)
-                                encoder.releaseOutputBuffer(outIndex, false)
-                                outIndex = encoder.dequeueOutputBuffer(bufferInfo, 0)
-                            }
-                        }
-
-                        // EOS 처리
-                        val inIndex = encoder.dequeueInputBuffer(10_000)
-                        if (inIndex >= 0) {
-                            encoder.queueInputBuffer(
-                                inIndex,
-                                0,
-                                0,
-                                0,
-                                MediaCodec.BUFFER_FLAG_END_OF_STREAM
-                            )
-                        }
-                        encoder.signalEndOfInputStream()
-
-                        var outIndex = encoder.dequeueOutputBuffer(bufferInfo, 10_000)
-                        while (outIndex >= 0) {
-                            val encodedData = encoder.getOutputBuffer(outIndex)!!
-                            muxer.writeSampleData(trackIndex, encodedData, bufferInfo)
-                            encoder.releaseOutputBuffer(outIndex, false)
-                            outIndex = encoder.dequeueOutputBuffer(bufferInfo, 0)
-                        }
-
-                    } catch (e: Exception) {
-                        Log.e("runModelOnVideo", "Encoder/Muxer error", e)
-                    } finally {
-                        muxer.stop()
-                        muxer.release()
+                while (capture.read(matFrame)) {
+                    if (writer == null) {
+                        // 첫 프레임 읽은 후 writer 초기화
+                        val frameWidth = matFrame.cols()
+                        val frameHeight = matFrame.rows()
+                        val fourcc = org.opencv.videoio.VideoWriter.fourcc('M','J','P','G')
+                        writer = VideoWriter(
+                            "/data/user/0/com.nightlens/cache/enhanced_video.avi",
+                            fourcc,
+                            fps,
+                            Size(frameWidth.toDouble(), frameHeight.toDouble())
+                        )
+                        if (!writer.isOpened) throw Exception("Cannot open VideoWriter")
                     }
+
+                    if (tmpBitmap == null || tmpBitmap.width != matFrame.cols() || tmpBitmap.height != matFrame.rows()) {
+                        tmpBitmap = Bitmap.createBitmap(matFrame.cols(), matFrame.rows(), Bitmap.Config.ARGB_8888)
+                    }
+
+                    Utils.matToBitmap(matFrame, tmpBitmap)
+
+                    val inputBuffer = dataConverter!!.convertBitmapToByteBuffer(tmpBitmap!!)
+                    val outputBuffer = ByteBuffer.allocateDirect(256 * 256 * 3 * 4).order(ByteOrder.nativeOrder())
+                    interpreter!!.run(inputBuffer, outputBuffer)
+                    outputBuffer.rewind()
+
+                    val enhancedBitmap = dataConverter!!.convertByteBufferToBitmap(outputBuffer, 256, 256)
+                    val finalBitmap = Bitmap.createScaledBitmap(enhancedBitmap, matFrame.cols(), matFrame.rows(), true)
+
+                    val outputMat = Mat()
+                    Utils.bitmapToMat(finalBitmap, outputMat)
+                    if (outputMat.channels() == 4) {
+                        Imgproc.cvtColor(outputMat, outputMat, Imgproc.COLOR_RGBA2BGR)
+                    }
+
+                    writer.write(outputMat)
                 }
 
-                decoderJob.join()
-                inferenceJob.join()
-                encoderJob.join()
-
-                decoder.stop()
-                decoder.release()
-                encoder.stop()
-                encoder.release()
-                extractor.release()
+                capture.release()
+                writer?.release()
 
                 withContext(Dispatchers.Main) {
-                    promise.resolve(outputPath)
+                    promise.resolve("/data/user/0/com.nightlens/cache/enhanced_video.avi")
                 }
 
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    promise.reject("VIDEO_CPU_ERROR", e.message, e)
+                    promise.reject("VIDEO_OPEN_CV_ERROR", e.message, e)
                 }
             }
         }
@@ -379,9 +259,7 @@ class IATModelModule(private val reactContext: ReactApplicationContext) :
 
 
 
-
-
-        // Bitmap -> NV12
+    // Bitmap -> NV12
     fun bitmapToNV12(bitmap: Bitmap): ByteArray {
         val width = bitmap.width
         val height = bitmap.height
@@ -477,6 +355,34 @@ class IATModelModule(private val reactContext: ReactApplicationContext) :
         val canvas: Canvas = surface.lockCanvas(null)
         canvas.drawBitmap(bitmap, 0f, 0f, null)
         surface.unlockCanvasAndPost(canvas)
+    }
+
+    @ReactMethod
+    fun saveVideoToGallery(fileName: String, videoPath: String, promise: Promise) {
+        try {
+            val context = reactApplicationContext
+            val values = ContentValues().apply {
+                put(MediaStore.Video.Media.DISPLAY_NAME, fileName)
+                put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+                put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/NightLens")
+            }
+
+            val resolver = context.contentResolver
+            val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values)
+
+            if (uri != null) {
+                resolver.openOutputStream(uri).use { outStream ->
+                    File(videoPath).inputStream().use { inStream ->
+                        inStream.copyTo(outStream!!)
+                    }
+                }
+                promise.resolve("Saved to gallery: $uri")
+            } else {
+                promise.reject("SAVE_ERROR", "Failed to insert into MediaStore")
+            }
+        } catch (e: Exception) {
+            promise.reject("SAVE_ERROR", e.message, e)
+        }
     }
 
     override fun onHostResume() {

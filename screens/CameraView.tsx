@@ -17,23 +17,26 @@ import {
 import { CameraRoll } from '@react-native-camera-roll/camera-roll';
 import {
   Camera,
-  useCameraDevice,
-  useCameraPermission,
+  useCameraDevices,
+  CameraPermissionStatus
 } from 'react-native-vision-camera';
 import { Svg, Path, Circle } from 'react-native-svg';
-import { NativeModules } from 'react-native';
+import { NativeEventEmitter, NativeModules } from 'react-native';
+console.log(NativeModules.IATModelModule);
 import RNFS from 'react-native-fs';
 import { launchImageLibrary } from 'react-native-image-picker';
 
 
-
 const { IATModelModule } = NativeModules;
+
 
 // 이제 이 컴포넌트는 독립적으로 동작하므로 props가 필요 없습니다.
 function CameraView(): React.JSX.Element {
-  const { hasPermission, requestPermission } = useCameraPermission();
+  const [hasPermission, setHasPermission] = useState<boolean | null>(null);
+  const [isModelInitialized, setIsModelInitialized] = useState(false);
   const [devicePosition, setDevicePosition] = useState<'front' | 'back'>('back');
-  const device = useCameraDevice(devicePosition);
+  const devices = useCameraDevices();
+  const device = devices[devicePosition];
   const camera = useRef<Camera>(null);
 
   const [captureMode, setCaptureMode] = useState<'photo' | 'video'>('photo');
@@ -52,23 +55,12 @@ function CameraView(): React.JSX.Element {
   const animatedValue = useRef(new Animated.Value(0)).current;
   const [galleryIconLayout, setGalleryIconLayout] = useState({ x: 0, y: 0, width: 0, height: 0 });
 
-
-  useEffect(() => {
-    if (!hasPermission) {
-      requestPermission();
-    }
-    requestAndroidPermissions();
-
-    IATModelModule.initializeModel()
-      .then((result: string) => console.log('Model Initialization:', result))
-      .catch((error: Error) => Alert.alert('모델 초기화 실패', error.message));
-  }, [hasPermission]);
-
   const requestAndroidPermissions = async () => {
     if (Platform.OS === 'android') {
       const statuses = await PermissionsAndroid.requestMultiple([
         PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES,
         PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
+        PermissionsAndroid.PERMISSIONS.READ_MEDIA_VIDEO,
       ]);
       if (statuses[PermissionsAndroid.PERMISSIONS.READ_MEDIA_IMAGES] === 'granted') {
         fetchLatestPhoto();
@@ -77,6 +69,98 @@ function CameraView(): React.JSX.Element {
       fetchLatestPhoto();
     }
   };
+
+  const emitter = new NativeEventEmitter(IATModelModule);
+
+  useEffect(() => {
+  const sub = emitter.addListener('VideoEnhanceProgress', (progress: number) => {
+    if (progress === -1) setIsLoading(true);       // 스피너 시작
+    else if (progress === 1 || progress === -2) setIsLoading(false); // 완료/실패
+    else {
+      // 진행률 표시하고 싶으면 여기에 state 추가
+      console.log('Video progress:', progress);
+    }
+  });
+
+  return () => sub.remove();
+}, []);
+
+
+  async function requestCameraPermission(): Promise<boolean> {
+    if (Platform.OS === 'android') {
+      const granted = await PermissionsAndroid.request(
+        PermissionsAndroid.PERMISSIONS.CAMERA,
+        {
+          title: '카메라 권한 요청',
+          message: '앱에서 카메라를 사용하려면 권한이 필요합니다.',
+          buttonPositive: '확인',
+          buttonNegative: '취소',
+        }
+      );
+      return granted === PermissionsAndroid.RESULTS.GRANTED;
+    } else {
+      // iOS 권한 요청은 Vision Camera 내장 함수 사용 가능
+      const status = await Camera.requestCameraPermission();
+      return status === 'authorized';
+    }
+  }
+
+  useEffect(() => {
+    const checkPermissionsAndInit = async () => {
+      const granted = await requestCameraPermission();
+      setHasPermission(granted);
+      if (granted) {
+        await requestAndroidPermissions();
+        try {
+          const result = await IATModelModule.initializeModel();
+          setIsModelInitialized(true);
+          console.log('Model Initialization:', result);
+        } catch (error: any) {
+          Alert.alert('모델 초기화 실패', error.message);
+        }
+      }
+    };
+    checkPermissionsAndInit();
+  }, []);
+
+  if (!hasPermission) {
+  return (
+    <View style={styles.container}>
+      <Text style={styles.text}>카메라 권한이 필요합니다.</Text>
+      <TouchableOpacity
+        style={styles.permissionButton}
+        onPress={async () => {
+          const granted = await requestCameraPermission();
+          setHasPermission(granted);
+        }}
+      >
+        <Text style={styles.permissionButtonText}>권한 허용</Text>
+      </TouchableOpacity>
+    </View>
+  );
+}
+
+  
+
+  const permissionUI = (
+    <View style={styles.container}>
+      <Text style={styles.text}>카메라 권한이 필요합니다.</Text>
+      <TouchableOpacity
+        style={styles.permissionButton}
+        onPress={async () => {
+          const granted = await requestCameraPermission();
+          setHasPermission(granted);
+          if (granted) await requestAndroidPermissions();
+        }}
+      >
+        <Text style={styles.permissionButtonText}>권한 허용</Text>
+      </TouchableOpacity>
+    </View>
+  );
+
+  if (!hasPermission) return permissionUI;
+  if (device == null) return <View style={styles.container}><Text style={styles.text}>카메라를 찾을 수 없습니다.</Text></View>;
+
 
   const fetchLatestPhoto = async () => {
     try {
@@ -128,8 +212,14 @@ function CameraView(): React.JSX.Element {
     }
   };
 
+
   const processImage = async (imagePath: string) => {
     if (isLoading) return;
+
+    if (!isModelInitialized) {
+    Alert.alert('알림', '모델이 아직 초기화되지 않았습니다. 잠시만 기다려 주세요.');
+    return;
+  }
     setIsLoading(true);
     try {
       // 이미지 경로에서 'file://' 접두사를 제거해야 RNFS가 제대로 파일을 읽을 수 있습니다.
@@ -193,62 +283,84 @@ function CameraView(): React.JSX.Element {
       }
     }
   };
-  
-  const onStartRecording = () => { 
-  if (camera.current == null) return;
+
+  const onStartRecording = async () => {
+  if (!camera.current) {
+    Alert.alert('오류', '카메라가 준비되지 않았습니다.');
+    return;
+  }
+
+  if (isRecording) {
+    Alert.alert('알림', '이미 녹화 중입니다.');
+    return;
+  }
+
+  if (!isModelInitialized && isNightModeEnabled) {
+    Alert.alert('모델 초기화 필요', '모델이 아직 준비되지 않았습니다.');
+    return;
+  }
+
   setIsRecording(true);
 
-  camera.current.startRecording({
-    onRecordingFinished: async (video: { path: string }) => {
-      setIsRecording(false);
-      const inputPath = `file://${video.path}`;
-      const outputPath = `${RNFS.CachesDirectoryPath}/enhanced_${Date.now()}.mp4`;
+  try {
+    camera.current.startRecording({
+      onRecordingFinished: async (video: { path: string }) => {
+        setIsRecording(false);
 
-      if (isNightModeEnabled) {
-        setIsLoading(true); // 로딩 표시 시작
+        // Android 전용 file:// 제거
+        const inputPath = video.path.startsWith('file://') ? video.path.slice(7) : video.path;
+
+        if (isNightModeEnabled) setIsLoading(true);
+
         try {
-          // Native Module에서 안전하게 비디오 처리
-          await IATModelModule.runModelOnVideo(inputPath, outputPath);
-          await CameraRoll.save(outputPath, { type: 'video', album: 'NightLens' });
+          // NightMode일 때만 모델 실행
+          const processedPath = isNightModeEnabled
+            ? await IATModelModule.runModelOnVideo(inputPath)
+            : inputPath;
+
+          const finalPath = processedPath;
+
+          // Movies/NightLens 폴더에 저장
+          const fileName = `NightLens_${Date.now()}.avi`;
+
+          // IATModelModule로 직접 저장 (복사 + DB 등록)
+          await IATModelModule.saveVideoToGallery(fileName, processedPath);
+
+          Alert.alert('완료', '영상이 갤러리에 저장되었습니다!');
         } catch (e: any) {
-          console.error('Night Mode 비디오 처리 실패:', e);
+          console.error('비디오 처리 실패:', e);
           Alert.alert('오류', '비디오를 처리하는 중 오류가 발생했습니다.');
         } finally {
-          setIsLoading(false); // 로딩 종료
+          setIsLoading(false);
+          fetchLatestPhoto();
         }
-      } else {
-        // Night Mode 꺼진 경우 원본 저장
-        try {
-          await CameraRoll.save(inputPath, { type: 'video', album: 'NightLens' });
-        } catch (e) {
-          console.error('원본 저장 실패:', e);
-          Alert.alert('오류', '영상을 저장하는 중 오류가 발생했습니다.');
-        }
-      }
-
-      fetchLatestPhoto(); // 갤러리 최신 사진/영상 업데이트
-    },
-    onRecordingError: (error: unknown) => {
-      console.error('녹화 오류: ', error);
-      setIsRecording(false);
-      Alert.alert('오류', '녹화 중 오류가 발생했습니다.');
-    },
-  });
+      },
+      onRecordingError: (error: unknown) => {
+        console.error('녹화 오류:', error);
+        setIsRecording(false);
+        Alert.alert('오류', '녹화 중 오류가 발생했습니다.');
+      },
+    });
+  } catch (err) {
+    console.error('녹화 시작 실패:', err);
+    setIsRecording(false);
+    Alert.alert('오류', '녹화를 시작할 수 없습니다.');
+  }
 };
 
-const onStopRecording = () => { 
-  if (camera.current == null) return;
+
+const onStopRecording = () => {
+  if (!camera.current) return;
 
   try {
-    camera.current.stopRecording(); // 반환값 사용 안 함, Native에서 처리
+    camera.current.stopRecording();
+    setIsRecording(false);
   } catch (e) {
     console.error('녹화 중지 실패:', e);
     setIsRecording(false);
     Alert.alert('오류', '녹화 중지 중 오류가 발생했습니다.');
   }
 };
-
-
 
   const onFlipCamera = () => setDevicePosition(p => (p === 'back' ? 'front' : 'back'));
   const toggleCaptureMode = () => setCaptureMode(m => (m === 'photo' ? 'video' : 'photo'));
@@ -309,7 +421,7 @@ const onStopRecording = () => {
         isActive={true}
         photo={captureMode === 'photo'}
         video={captureMode === 'video'}
-        audio={captureMode === 'video'}
+        audio={false}
 
       />
 
@@ -403,6 +515,17 @@ const onStopRecording = () => {
 }
 
 const styles = StyleSheet.create({
+  permissionButton: {
+      marginTop: 20,
+      padding: 12,
+      backgroundColor: '#81b0ff',
+      borderRadius: 8,
+    },
+    permissionButtonText: {
+      color: 'white',
+      fontWeight: 'bold',
+      textAlign: 'center',
+    },
   container: { flex: 1, backgroundColor: 'black' },
   text: { color: 'white', fontSize: 18, textAlign: 'center' },
   topButtonsContainer: { position: 'absolute', top: 60, left: 20, right: 20, flexDirection: 'row', justifyContent: 'space-between' },

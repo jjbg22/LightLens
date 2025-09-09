@@ -1,0 +1,15 @@
+diff --git a/node_modules/react-native-svg/android/build.gradle b/node_modules/react-native-svg/android/build.gradle
+index 5dfc225..e694f3a 100644
+--- a/node_modules/react-native-svg/android/build.gradle
++++ b/node_modules/react-native-svg/android/build.gradle
+@@ -74,6 +74,10 @@ android {
+             }
+         }
+     }
++
++    buildFeatures {
++        buildConfig = true
++    }
+ }
+ 
+ repositories {
