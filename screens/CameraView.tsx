@@ -321,7 +321,7 @@ function CameraView(): React.JSX.Element {
           const finalPath = processedPath;
 
           // Movies/NightLens 폴더에 저장
-          const fileName = `NightLens_${Date.now()}.avi`;
+          const fileName = `NightLens_${Date.now()}.mp4`;
 
           // IATModelModule로 직접 저장 (복사 + DB 등록)
           await IATModelModule.saveVideoToGallery(fileName, processedPath);

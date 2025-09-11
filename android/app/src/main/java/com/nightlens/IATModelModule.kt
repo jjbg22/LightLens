@@ -17,17 +17,13 @@ import android.graphics.Matrix
 import android.media.ExifInterface
 import java.io.File
 import android.media.Image
-import android.view.Surface
-import android.graphics.Canvas
 import org.opencv.android.OpenCVLoader
 import org.opencv.videoio.VideoCapture
-import org.opencv.imgproc.Imgproc
 import org.opencv.android.Utils
-import org.opencv.core.Mat
-import org.opencv.core.Size
-import org.opencv.videoio.VideoWriter
 import android.content.ContentValues
 import android.provider.MediaStore
+import com.nightlens.VideoEncoder
+import android.media.MediaMetadataRetriever
 
 
 
@@ -89,6 +85,19 @@ class IATModelModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
+    private fun padToSquare(bitmap: Bitmap): Bitmap {
+        val width = bitmap.width
+        val height = bitmap.height
+        val maxSide = kotlin.math.max(width, height)
+        val paddedBitmap = Bitmap.createBitmap(maxSide, maxSide, Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(paddedBitmap)
+        canvas.drawColor(android.graphics.Color.BLACK)
+        val left = (maxSide - width) / 2f
+        val top = (maxSide - height) / 2f
+        canvas.drawBitmap(bitmap, left, top, null)
+        return paddedBitmap
+    }
+
     @ReactMethod
     fun runModelOnImage(base64Input: String, promise: Promise) {
         if (interpreter == null || dataConverter == null) {
@@ -100,40 +109,64 @@ class IATModelModule(private val reactContext: ReactApplicationContext) :
             try {
                 val inputBytes = Base64.decode(base64Input, Base64.DEFAULT)
                 val inputBitmap = BitmapFactory.decodeByteArray(inputBytes, 0, inputBytes.size)
+
                 val rotatedBitmap = rotateBitmapIfRequired(inputBitmap, inputBytes)
-                val inputBuffer = dataConverter!!.convertBitmapToByteBuffer(rotatedBitmap)
+                val originalWidth = rotatedBitmap.width
+                val originalHeight = rotatedBitmap.height
 
+                // 1. 패딩 적용: 원본 비율을 유지하며 정사각형으로 만듭니다.
+                val paddedInput = padToSquare(rotatedBitmap)
+                val modelInput = Bitmap.createScaledBitmap(paddedInput, 256, 256, true)
+
+                val inputBuffer = dataConverter!!.convertBitmapToByteBuffer(modelInput)
+
+                // 모델 실행
                 val outputShape = interpreter!!.getOutputTensor(1).shape()
-                val outputDataType = interpreter!!.getOutputTensor(1).dataType()
-
-                Log.d("IATModel", "Output tensor shape: ${outputShape.joinToString(", ")}")
-                Log.d("IATModel", "Output tensor dtype: $outputDataType")
-
-
-                val outputChannels = outputShape[1]  // 3
-                val outputHeight = outputShape[2]    // 256
-                val outputWidth = outputShape[3]     // 256
-
-                // float = 4 bytes
+                val outputHeight = outputShape[2] // 256
+                val outputWidth = outputShape[3]  // 256
+                val outputChannels = outputShape[1]
                 val outputBufferSize = 1 * outputHeight * outputWidth * outputChannels * 4
-
                 val outputBuffer = ByteBuffer.allocateDirect(outputBufferSize).order(ByteOrder.nativeOrder())
-
                 outputBuffer.rewind()
 
                 interpreter!!.run(inputBuffer, outputBuffer)
                 outputBuffer.rewind()
 
-                val outputBitmap = dataConverter!!.convertByteBufferToBitmap(outputBuffer, outputWidth, outputHeight)
+                // 2. 모델 결과물로부터 패딩을 제거하고 원본 비율로 되돌립니다.
+                val enhancedBitmap = dataConverter!!.convertByteBufferToBitmap(outputBuffer, outputWidth, outputHeight)
 
+                val finalBitmap: Bitmap
+                if (originalWidth > originalHeight) { // 가로가 긴 이미지일 경우
+                    val cropHeight = (256 * originalHeight.toFloat() / originalWidth.toFloat()).toInt()
+                    val topOffset = (256 - cropHeight) / 2
+                    val croppedResult = Bitmap.createBitmap(enhancedBitmap, 0, topOffset, 256, cropHeight)
+                    finalBitmap = Bitmap.createScaledBitmap(croppedResult, originalWidth, originalHeight, true)
+                    croppedResult.recycle()
+                } else { // 세로가 긴 이미지일 경우
+                    val cropWidth = (256 * originalWidth.toFloat() / originalHeight.toFloat()).toInt()
+                    val leftOffset = (256 - cropWidth) / 2
+                    val croppedResult = Bitmap.createBitmap(enhancedBitmap, leftOffset, 0, cropWidth, 256)
+                    finalBitmap = Bitmap.createScaledBitmap(croppedResult, originalWidth, originalHeight, true)
+                    croppedResult.recycle()
+                }
 
+                // Base64로 변환하여 반환
                 val outputStream = java.io.ByteArrayOutputStream()
-                outputBitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
+                finalBitmap.compress(Bitmap.CompressFormat.PNG, 100, outputStream)
                 val outputBase64 = Base64.encodeToString(outputStream.toByteArray(), Base64.NO_WRAP)
 
                 withContext(Dispatchers.Main) {
                     promise.resolve(outputBase64)
                 }
+
+                // 메모리 해제
+                inputBitmap.recycle()
+                rotatedBitmap.recycle()
+                paddedInput.recycle()
+                modelInput.recycle()
+                enhancedBitmap.recycle()
+                finalBitmap.recycle()
+
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     promise.reject("MODEL_RUN_ERROR", e.message, e)
@@ -141,6 +174,7 @@ class IATModelModule(private val reactContext: ReactApplicationContext) :
             }
         }
     }
+
 
     private fun rotateBitmapIfRequired(bitmap: Bitmap, imageBytes: ByteArray): Bitmap {
         return try {
@@ -161,6 +195,20 @@ class IATModelModule(private val reactContext: ReactApplicationContext) :
             if (matrix.isIdentity) bitmap else Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
         } catch (e: Exception) {
             bitmap
+        }
+    }
+
+    private fun getVideoRotationAngle(path: String): Int {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(path)
+            val rotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)
+            rotation?.toIntOrNull() ?: 0
+        } catch (e: Exception) {
+            Log.e("VideoDebug", "Error getting video rotation: ${e.message}")
+            0 // 오류 발생 시 기본값 0으로 설정
+        } finally {
+            retriever.release()
         }
     }
 
@@ -198,59 +246,67 @@ class IATModelModule(private val reactContext: ReactApplicationContext) :
                     return@launch
                 }
 
+                val rotationAngle = getVideoRotationAngle(cleanPath)
+                Log.d("VideoDebug", "Detected rotation angle from MediaMetadataRetriever: $rotationAngle")
+
                 val fps = capture.get(org.opencv.videoio.Videoio.CAP_PROP_FPS)
+                var frameWidth = capture.get(org.opencv.videoio.Videoio.CAP_PROP_FRAME_WIDTH).toInt()
+                var frameHeight = capture.get(org.opencv.videoio.Videoio.CAP_PROP_FRAME_HEIGHT).toInt()
+                Log.d("VideoDebug", "Captured FPS: $fps") // 이 로그를 확인하세요.
+
                 val matFrame = org.opencv.core.Mat()
-                var writer: VideoWriter? = null
                 var tmpBitmap: Bitmap? = null
 
-                while (capture.read(matFrame)) {
-                    if (writer == null) {
-                        // 첫 프레임 읽은 후 writer 초기화
-                        val frameWidth = matFrame.cols()
-                        val frameHeight = matFrame.rows()
-                        val fourcc = org.opencv.videoio.VideoWriter.fourcc('M','J','P','G')
-                        writer = VideoWriter(
-                            "/data/user/0/com.nightlens/cache/enhanced_video.avi",
-                            fourcc,
-                            fps,
-                            Size(frameWidth.toDouble(), frameHeight.toDouble())
-                        )
-                        if (!writer.isOpened) throw Exception("Cannot open VideoWriter")
-                    }
+                // ⭐️ 수정: 비디오가 세로 방향일 경우, 인코더의 너비와 높이를 바꿉니다.
+                if (rotationAngle == 90 || rotationAngle == 270) {
+                    val temp = frameWidth
+                    frameWidth = frameHeight
+                    frameHeight = temp
+                }
 
-                    if (tmpBitmap == null || tmpBitmap.width != matFrame.cols() || tmpBitmap.height != matFrame.rows()) {
-                        tmpBitmap = Bitmap.createBitmap(matFrame.cols(), matFrame.rows(), Bitmap.Config.ARGB_8888)
-                    }
+                val outputPath = "${reactContext.cacheDir}/enhanced_video_${System.currentTimeMillis()}.mp4"
+
+                val completionDeferred = CompletableDeferred<String>()
+                val encoder = VideoEncoder(outputPath, frameWidth, frameHeight, fps.toInt(), completionDeferred)
+                encoder.start()
+
+                while (capture.read(matFrame)) {
+                    tmpBitmap = Bitmap.createBitmap(matFrame.cols(), matFrame.rows(), Bitmap.Config.ARGB_8888)
 
                     Utils.matToBitmap(matFrame, tmpBitmap)
 
-                    val inputBuffer = dataConverter!!.convertBitmapToByteBuffer(tmpBitmap!!)
+                    // ⭐️ 수정: 감지된 각도에 따라 프레임 비트맵을 회전시킵니다.
+                    val matrix = Matrix()
+                    matrix.postRotate(rotationAngle.toFloat())
+                    val rotatedBitmap = Bitmap.createBitmap(tmpBitmap!!, 0, 0, tmpBitmap.width, tmpBitmap.height, matrix, true)
+                    tmpBitmap!!.recycle() // 원본 비트맵 메모리 해제
+
+                    val inputBuffer = dataConverter!!.convertBitmapToByteBuffer(rotatedBitmap)
                     val outputBuffer = ByteBuffer.allocateDirect(256 * 256 * 3 * 4).order(ByteOrder.nativeOrder())
                     interpreter!!.run(inputBuffer, outputBuffer)
                     outputBuffer.rewind()
 
                     val enhancedBitmap = dataConverter!!.convertByteBufferToBitmap(outputBuffer, 256, 256)
-                    val finalBitmap = Bitmap.createScaledBitmap(enhancedBitmap, matFrame.cols(), matFrame.rows(), true)
+                    val finalBitmap = Bitmap.createScaledBitmap(enhancedBitmap, frameWidth, frameHeight, true)
 
-                    val outputMat = Mat()
-                    Utils.bitmapToMat(finalBitmap, outputMat)
-                    if (outputMat.channels() == 4) {
-                        Imgproc.cvtColor(outputMat, outputMat, Imgproc.COLOR_RGBA2BGR)
-                    }
+                    encoder.enqueueFrame(finalBitmap)
 
-                    writer.write(outputMat)
+                    rotatedBitmap.recycle()
+                    enhancedBitmap.recycle()
                 }
 
                 capture.release()
-                writer?.release()
+
+                encoder.stop()
+                val finalOutputPath = completionDeferred.await()
 
                 withContext(Dispatchers.Main) {
-                    promise.resolve("/data/user/0/com.nightlens/cache/enhanced_video.avi")
+                    promise.resolve(finalOutputPath)
                 }
 
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    promise.reject("VIDEO_OPEN_CV_ERROR", e.message, e)
+                    promise.reject("VIDEO_ENCODING_ERROR", e.message, e)
                 }
             }
         }
@@ -350,12 +406,6 @@ class IATModelModule(private val reactContext: ReactApplicationContext) :
         return bitmap
     }
 
-
-    fun renderBitmapToSurface(bitmap: Bitmap, surface: Surface) {
-        val canvas: Canvas = surface.lockCanvas(null)
-        canvas.drawBitmap(bitmap, 0f, 0f, null)
-        surface.unlockCanvasAndPost(canvas)
-    }
 
     @ReactMethod
     fun saveVideoToGallery(fileName: String, videoPath: String, promise: Promise) {

@@ -50,9 +50,9 @@ class IATModelLoader(context: Context, modelFileName: String = "IAT.tflite") {
 
         for (i in intValues.indices) {
             val pixel = intValues[i]
-            r[i] = ((pixel shr 16) and 0xFF) / 255.0f * 2f - 1f  // R: 0~255 → -1~1
-            g[i] = ((pixel shr 8) and 0xFF) / 255.0f * 2f - 1f   // G: 0~255 → -1~1
-            b[i] = (pixel and 0xFF) / 255.0f * 2f - 1f          // B: 0~255 → -1~1
+            r[i] = ((pixel shr 16) and 0xFF) / 255.0f * 2f - 1f // R: 0~255 → -1~1
+            g[i] = ((pixel shr 8) and 0xFF) / 255.0f * 2f - 1f // G: 0~255 → -1~1
+            b[i] = (pixel and 0xFF) / 255.0f * 2f - 1f // B: 0~255 → -1~1
         }
 
         for (i in 0 until 256 * 256) byteBuffer.putFloat(r[i])
@@ -70,15 +70,17 @@ class IATModelLoader(context: Context, modelFileName: String = "IAT.tflite") {
         val g = FloatArray(size)
         val b = FloatArray(size)
 
+
+
         // 먼저 채널별로 값을 분리해서 읽음 (CHW)
         for (i in 0 until size) r[i] = buffer.float
         for (i in 0 until size) g[i] = buffer.float
         for (i in 0 until size) b[i] = buffer.float
 
-        Log.d("IATModel", "Pixel [0]: R=${r[0]}, G=${g[0]}, B=${b[0]}")
-        if (r.size > 1000 && g.size > 1000 && b.size > 1000) {
-            Log.d("IATModel", "Pixel [1000]: R=${r[1000]}, G=${g[1000]}, B=${b[1000]}")
-        }
+        // convertByteBufferToBitmap 함수 내, 채널별로 값을 읽어온 후 추가
+        Log.d("IATDebug", "R channel first value: ${r[0]}")
+        Log.d("IATDebug", "G channel first value: ${g[0]}")
+        Log.d("IATDebug", "B channel first value: ${b[0]}")
 
         // RGB로 결합
         val pixels = IntArray(size)
@@ -87,7 +89,7 @@ class IATModelLoader(context: Context, modelFileName: String = "IAT.tflite") {
             val green = (g[i] * 255f).toInt().coerceIn(0, 255)
             val blue = (b[i] * 255f).toInt().coerceIn(0, 255)
 
-            pixels[i] = (0xFF shl 24) or (red shl 16) or (green shl 8) or blue
+            pixels[i] = (0xFF shl 24) or (blue shl 16) or (green shl 8) or red
         }
 
         return Bitmap.createBitmap(pixels, width, height, Bitmap.Config.ARGB_8888)
