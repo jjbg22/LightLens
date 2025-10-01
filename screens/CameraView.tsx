@@ -13,6 +13,7 @@ import {
   Animated,
   ActivityIndicator,
   LayoutChangeEvent, // onLayout 이벤트 타입을 위해 추가
+  InteractionManager,
 } from 'react-native';
 import { CameraRoll } from '@react-native-camera-roll/camera-roll';
 import {
@@ -111,13 +112,17 @@ function CameraView(): React.JSX.Element {
       setHasPermission(granted);
       if (granted) {
         await requestAndroidPermissions();
-        try {
-          const result = await IATModelModule.initializeModel();
-          setIsModelInitialized(true);
-          console.log('Model Initialization:', result);
-        } catch (error: any) {
-          Alert.alert('모델 초기화 실패', error.message);
-        }
+
+        InteractionManager.runAfterInteractions(async () => {
+                try {
+                    const result = await IATModelModule.initializeModel();
+                    setIsModelInitialized(true);
+                    console.log('Model Initialization:', result);
+                } catch (error: any) {
+                    // 💡 오류 로깅을 강화하여 메시지를 명확히 전달
+                    Alert.alert('모델 초기화 실패', error.message || '알 수 없는 오류');
+                }
+              });
       }
     };
     checkPermissionsAndInit();
@@ -236,29 +241,39 @@ function CameraView(): React.JSX.Element {
     }
   };
 
-  const onTakePhoto = async () => {
-    if (camera.current == null || isLoading) return;
+const onTakePhoto = async () => {
+  if (camera.current == null || isLoading) return;
 
-    Animated.sequence([
-      Animated.timing(flashOpacity, { toValue: 0.8, duration: 100, useNativeDriver: true }),
-      Animated.timing(flashOpacity, { toValue: 0, duration: 200, useNativeDriver: true }),
-    ]).start();
+  // 1. 플래시 애니메이션
+  Animated.sequence([
+    Animated.timing(flashOpacity, { toValue: 0.8, duration: 100, useNativeDriver: true }),
+    Animated.timing(flashOpacity, { toValue: 0, duration: 200, useNativeDriver: true }),
+  ]).start();
 
-    try {
-      const photo = await camera.current.takePhoto({ flash: 'off' });
-      const path = `file://${photo.path}`;
+  try {
+    // 2. 사진 촬영을 직접 호출
+    console.log("사진 촬영을 시작합니다...");
+    const photo = await camera.current.takePhoto({ flash: 'off' });
+    const path = `file://${photo.path}`;
+    console.log(`사진이 촬영되었습니다: ${path}`);
 
-      if (isNightModeEnabled) {
-        await processImage(path);
-      } else {
-        await saveAndAnimate(path, false);
-      }
-    } catch (e: any) {
-      console.error('사진 처리 실패: ', e);
-      Alert.alert('오류', '사진을 처리하는 중 오류가 발생했습니다.');
+    // 3. 이미지 처리
+    if (isNightModeEnabled) {
+      console.log("야간 모드 이미지 처리를 시작합니다...");
+      await processImage(path);
+    } else {
+      console.log("일반 모드로 사진을 저장합니다...");
+      await saveAndAnimate(path, false);
+    }
+  } catch (e: any) {
+    console.error('사진 촬영 또는 처리 실패: ', e);
+    Alert.alert('오류', `사진 촬영 또는 처리 중 오류가 발생했습니다: ${e.message || String(e)}`);
+    // 오류 발생 시 로딩 상태가 켜져 있다면 반드시 꺼줘야 합니다.
+    if (isLoading) {
       setIsLoading(false);
-    } 
-  };
+    }
+  }
+};
 
   const handleSelectAndProcessImage = async () => {
     const response = await launchImageLibrary({

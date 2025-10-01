@@ -13,8 +13,6 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.CompletableDeferred
 import com.facebook.react.bridge.Promise
 
-
-
 class VideoEncoder(
     private val outputPath: String,
     private val width: Int,
@@ -29,23 +27,18 @@ class VideoEncoder(
     private var presentationTimeUs: Long = 0
     private val bufferInfo = MediaCodec.BufferInfo()
     private val TIMEOUT_US = 10000L
-    private val frameQueue = ArrayBlockingQueue<Bitmap>(10) // 10개 버퍼로 충분
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var isRunning = false
+    private val frameQueue = ArrayBlockingQueue<IntArray>(10)
 
-
-    private fun bitmapToNV12(bitmap: Bitmap): ByteArray {
+    private fun intArrayToNV12(pixels: IntArray): ByteArray {
         val yuv = ByteArray(width * height * 3 / 2)
-        val argb = IntArray(width * height)
-
-        bitmap.getPixels(argb, 0, width, 0, 0, width, height)
-
         var yIndex = 0
         var uvIndex = width * height
 
         for (j in 0 until height) {
             for (i in 0 until width) {
-                val pixel = argb[j * width + i]
+                val pixel = pixels[j * width + i]
                 val r = (pixel shr 16) and 0xff
                 val g = (pixel shr 8) and 0xff
                 val b = pixel and 0xff
@@ -65,17 +58,15 @@ class VideoEncoder(
         return yuv
     }
 
-
     fun start() {
         Log.d("VideoEncoder", "Starting encoder with path: $outputPath")
         try {
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar)
-                setInteger(MediaFormat.KEY_BIT_RATE, 2000000)
+                setInteger(MediaFormat.KEY_BIT_RATE, 1500000)
                 setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-                // ⭐️ 호환성을 위한 프로파일 및 레벨 추가
-                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileMain)
+                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
                 setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31)
             }
 
@@ -97,20 +88,28 @@ class VideoEncoder(
         }
     }
 
-    fun enqueueFrame(bitmap: Bitmap) {
+
+
+    // ✨ 수정: 비트맵의 복사본을 만들어 큐에 넣습니다.
+    fun enqueueFrame(pixels: IntArray) {
         if (isRunning) {
-            frameQueue.offer(bitmap) // 큐가 가득차면 버림
+            try {
+                frameQueue.put(pixels)
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                Log.e("VideoEncoder", "Enqueue frame interrupted", e)
+            }
         }
     }
 
-    // ⭐️ 수정: 비동기적으로 프레임을 처리하는 로직을 이 함수에 통합
+
     private suspend fun processFrames() {
         val frameIntervalUs = (1000000 / frameRate).toLong()
         var presentationTimeUs: Long = 0
 
         while (isRunning || frameQueue.isNotEmpty()) {
-            val bitmap = frameQueue.poll()
-            if (bitmap == null) {
+            val pixels = frameQueue.poll()
+            if (pixels == null) {
                 if (!isRunning) break
                 delay(10)
                 continue
@@ -121,10 +120,9 @@ class VideoEncoder(
             if (inputBufferIndex >= 0) {
                 val inputBuffer = encoder!!.getInputBuffer(inputBufferIndex)
                 inputBuffer?.let {
-                    val yuvData = bitmapToNV12(bitmap)
+                    val yuvData = intArrayToNV12(pixels)
                     it.clear()
                     it.put(yuvData)
-                    // ⭐️ presentationTimeUs를 수동으로 전달
                     encoder!!.queueInputBuffer(inputBufferIndex, 0, yuvData.size, presentationTimeUs, 0)
                     presentationTimeUs += frameIntervalUs
                 }
@@ -132,6 +130,7 @@ class VideoEncoder(
 
             drainEncoder(false)
         }
+        drainEncoder(true)
     }
 
     private fun drainEncoder(endOfStream: Boolean) {
@@ -182,12 +181,9 @@ class VideoEncoder(
     fun stop() {
         isRunning = false
 
-        // ⭐️ scope를 취소하여 processFrames 코루틴에 종료를 알림
         scope.cancel()
 
         runBlocking {
-            // 이 시점에서 processFrames()는 남아있는 프레임을 모두 처리하고
-            // drainEncoder(true)를 호출한 후 안전하게 종료될 것임
             scope.coroutineContext.job.join()
         }
         try {
