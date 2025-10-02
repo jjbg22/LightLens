@@ -3,7 +3,6 @@ package com.nightlens
 import android.content.Context
 import android.graphics.Bitmap
 import org.tensorflow.lite.Interpreter
-import org.tensorflow.lite.flex.FlexDelegate
 import java.io.FileInputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -13,17 +12,14 @@ import android.util.Log
 class IATModelLoader(context: Context, modelFileName: String = "IAT.tflite") {
 
     private var interpreter: Interpreter
-    private val flexDelegate = FlexDelegate()
 
     init {
-        // Interpreter 옵션에 Flex delegate 추가
-        val options = Interpreter.Options().addDelegate(flexDelegate)
-
-        // assets에서 모델 파일 로드
         val modelBuffer = loadModelFile(context, modelFileName)
 
-        // Interpreter 초기화
+        val options = Interpreter.Options()
         interpreter = Interpreter(modelBuffer, options)
+
+        Log.d("TFLite_Init", "Interpreter가 성공적으로 초기화되었습니다.")
     }
 
     // assets에서 tflite 모델을 ByteBuffer로 읽기
@@ -104,6 +100,7 @@ class IATModelLoader(context: Context, modelFileName: String = "IAT.tflite") {
         bitmap.setPixels(pixels, 0, width, 0, 0, width, height)
     }
 
+
     // 모델 추론 함수 (입출력 포맷에 맞게 조정 필요)
     fun runInferenceWithLogging(bitmap: Bitmap, inputBuffer: ByteBuffer): Pair<ByteBuffer, Long> {
         val startTime = System.currentTimeMillis()
@@ -134,6 +131,5 @@ class IATModelLoader(context: Context, modelFileName: String = "IAT.tflite") {
     // 필요시 interpreter close 함수 추가
     fun close() {
         interpreter.close()
-        flexDelegate.close()
     }
 }

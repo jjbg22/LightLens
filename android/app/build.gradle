@@ -151,6 +151,8 @@ dependencies {
     implementation 'org.tensorflow:tensorflow-lite:2.13.0'
     implementation 'org.tensorflow:tensorflow-lite-select-tf-ops:2.15.0'
 
+    implementation 'org.tensorflow:tensorflow-lite-gpu-delegate-plugin:0.4.0'
+
     // OpenCV (JitPack 빌드된 버전)
     implementation project(':opencv')
 
@@ -162,7 +164,6 @@ dependencies {
 
     implementation "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.7.3"
     implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3"
-
 }
 
 

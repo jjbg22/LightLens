@@ -1,17 +1,12 @@
 package com.nightlens
 
-import android.graphics.Bitmap
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.util.Log
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
-import java.util.concurrent.ArrayBlockingQueue
 import kotlinx.coroutines.*
-import kotlinx.coroutines.CompletableDeferred
-import com.facebook.react.bridge.Promise
+import java.util.concurrent.ArrayBlockingQueue
 
 class VideoEncoder(
     private val outputPath: String,
@@ -24,14 +19,23 @@ class VideoEncoder(
     private var muxer: MediaMuxer? = null
     private var videoTrackIndex = -1
     private var isMuxerStarted = false
-    private var presentationTimeUs: Long = 0
     private val bufferInfo = MediaCodec.BufferInfo()
     private val TIMEOUT_US = 10000L
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var isRunning = false
-    private val frameQueue = ArrayBlockingQueue<IntArray>(10)
 
-    private fun intArrayToNV12(pixels: IntArray): ByteArray {
+    // ✨ 1. 코루틴 Job을 관리할 변수 추가
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var processFramesJob: Job? = null
+
+    // ✨ 2. isRunning을 Volatile로 만들어 여러 스레드에서 안전하게 접근하도록 변경
+    @Volatile
+    private var isRunning = false
+
+    private val frameQueue = ArrayBlockingQueue<IntArray>(10)
+    // ✨ 3. 루프를 깨우고 종료 신호를 보낼 특별한 객체 (독약)
+    private val POISON_PILL = IntArray(0)
+
+    // YUV 변환 함수 (기존과 동일)
+    private fun intArrayToNV12(pixels: IntArray, width: Int, height: Int): ByteArray {
         val yuv = ByteArray(width * height * 3 / 2)
         var yIndex = 0
         var uvIndex = width * height
@@ -39,6 +43,7 @@ class VideoEncoder(
         for (j in 0 until height) {
             for (i in 0 until width) {
                 val pixel = pixels[j * width + i]
+                // ... (나머지 YUV 변환 로직은 동일) ...
                 val r = (pixel shr 16) and 0xff
                 val g = (pixel shr 8) and 0xff
                 val b = pixel and 0xff
@@ -50,151 +55,180 @@ class VideoEncoder(
                 yuv[yIndex++] = y.coerceIn(0, 255).toByte()
 
                 if (j % 2 == 0 && i % 2 == 0) {
-                    yuv[uvIndex++] = u.coerceIn(0, 255).toByte()
                     yuv[uvIndex++] = v.coerceIn(0, 255).toByte()
+                    yuv[uvIndex++] = u.coerceIn(0, 255).toByte()
                 }
             }
         }
         return yuv
     }
 
+
     fun start() {
-        Log.d("VideoEncoder", "Starting encoder with path: $outputPath")
+        if (isRunning) {
+            Log.w("VideoEncoder", "Encoder is already running.")
+            return
+        }
+        Log.d("VideoEncoder", "Starting encoder...")
         try {
             val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height).apply {
                 setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar)
-                setInteger(MediaFormat.KEY_BIT_RATE, 1500000)
+                setInteger(MediaFormat.KEY_BIT_RATE, 2_000_000) // 비트레이트 약간 상향
                 setInteger(MediaFormat.KEY_FRAME_RATE, frameRate)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-                setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
-                setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31)
             }
 
             encoder = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
             encoder!!.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-
             encoder!!.start()
+
             muxer = MediaMuxer(outputPath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
 
             isRunning = true
-            scope.launch {
+            // ✨ 4. 시작된 코루틴 Job을 변수에 저장
+            processFramesJob = scope.launch {
                 processFrames()
             }
 
         } catch (e: Exception) {
-            completionDeferred.completeExceptionally(e)
             Log.e("VideoEncoder", "ENCODER_START_FAILED", e)
-            stop()
+            completionDeferred.completeExceptionally(e)
+            stop() // 시작 실패 시 정리
         }
     }
 
-
-
-    // ✨ 수정: 비트맵의 복사본을 만들어 큐에 넣습니다.
-    fun enqueueFrame(pixels: IntArray) {
-        if (isRunning) {
-            try {
-                frameQueue.put(pixels)
-            } catch (e: InterruptedException) {
-                Thread.currentThread().interrupt()
-                Log.e("VideoEncoder", "Enqueue frame interrupted", e)
-            }
+    fun enqueueFrame(pixels: IntArray): Boolean {
+        if (!isRunning) return false
+        try {
+            // 원본 배열이 재사용될 수 있으므로, 큐에 넣기 전에 복사본을 만듭니다.
+            return frameQueue.offer(pixels.clone())
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            Log.w("VideoEncoder", "Enqueue frame interrupted")
         }
+        return false
     }
 
-
-    private suspend fun processFrames() {
-        val frameIntervalUs = (1000000 / frameRate).toLong()
+    private fun processFrames() {
+        val frameIntervalUs = (1_000_000 / frameRate).toLong()
         var presentationTimeUs: Long = 0
 
-        while (isRunning || frameQueue.isNotEmpty()) {
-            val pixels = frameQueue.poll()
-            if (pixels == null) {
-                if (!isRunning) break
-                delay(10)
-                continue
-            }
+        try {
+            while (true) {
+                // ✨ 5. poll 대신 take()를 사용해 큐가 비어있으면 대기 (효율적)
+                val pixels = frameQueue.take()
 
-            val inputBufferIndex = encoder!!.dequeueInputBuffer(TIMEOUT_US)
+                // 큐에서 '독약'을 받으면 루프 종료
+                if (pixels.isEmpty()) { // POISON_PILL 체크
+                    break
+                }
 
-            if (inputBufferIndex >= 0) {
-                val inputBuffer = encoder!!.getInputBuffer(inputBufferIndex)
-                inputBuffer?.let {
-                    val yuvData = intArrayToNV12(pixels)
-                    it.clear()
-                    it.put(yuvData)
+                val inputBufferIndex = encoder!!.dequeueInputBuffer(TIMEOUT_US)
+                if (inputBufferIndex >= 0) {
+                    val yuvData = intArrayToNV12(pixels, width, height)
+                    val inputBuffer = encoder!!.getInputBuffer(inputBufferIndex)!!
+                    inputBuffer.clear()
+                    inputBuffer.put(yuvData)
                     encoder!!.queueInputBuffer(inputBufferIndex, 0, yuvData.size, presentationTimeUs, 0)
                     presentationTimeUs += frameIntervalUs
                 }
+                drainEncoder(false)
             }
+            // 루프가 정상적으로 끝나면 마지막으로 인코더를 비워줌
+            drainEncoder(true)
 
-            drainEncoder(false)
+        } catch (e: Exception) {
+            Log.e("VideoEncoder", "Error in processFrames loop", e)
+            completionDeferred.completeExceptionally(e)
         }
-        drainEncoder(true)
     }
 
     private fun drainEncoder(endOfStream: Boolean) {
-        if (encoder == null || muxer == null) return
-
         if (endOfStream) {
-            encoder!!.signalEndOfInputStream()
+            try {
+                encoder?.signalEndOfInputStream()
+            } catch (e: IllegalStateException) {
+                Log.e("VideoEncoder", "signalEndOfInputStream failed, encoder might be in a wrong state.", e)
+                return // 여기서 중단
+            }
         }
 
         while (true) {
-            val outputBufferIndex = encoder!!.dequeueOutputBuffer(bufferInfo, TIMEOUT_US)
-            if (outputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                if (!endOfStream) break else Log.d("VideoEncoder", "No output available, still waiting")
-            } else if (outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                if (isMuxerStarted) {
-                    throw RuntimeException("Format changed after muxer start")
-                }
-                videoTrackIndex = muxer!!.addTrack(encoder!!.outputFormat)
-                muxer!!.start()
-                isMuxerStarted = true
-            } else if (outputBufferIndex < 0) {
-                Log.w("VideoEncoder", "Unexpected result from dequeueOutputBuffer: $outputBufferIndex")
-            } else {
-                Log.d("VideoEncoderDebug", "Output frame presentationTimeUs: ${bufferInfo.presentationTimeUs}")
+            val outputBufferIndex = try {
+                encoder!!.dequeueOutputBuffer(bufferInfo, TIMEOUT_US)
+            } catch (e: Exception) {
+                Log.e("VideoEncoder", "dequeueOutputBuffer failed", e)
+                break
+            }
 
-                val outputBuffer = encoder!!.getOutputBuffer(outputBufferIndex)
-                outputBuffer?.let {
-                    if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG != 0) {
-                        bufferInfo.size = 0
-                    }
-                    if (bufferInfo.size != 0) {
-                        if (!isMuxerStarted) {
-                            throw RuntimeException("Muxer not started!")
-                        }
-                        it.position(bufferInfo.offset)
-                        it.limit(bufferInfo.offset + bufferInfo.size)
-                        muxer!!.writeSampleData(videoTrackIndex, it, bufferInfo)
-                    }
+            when (outputBufferIndex) {
+                MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                    if (!endOfStream) break
                 }
-                encoder!!.releaseOutputBuffer(outputBufferIndex, false)
-                if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                    break
+                MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                    if (isMuxerStarted) throw RuntimeException("Format changed after muxer was started.")
+                    videoTrackIndex = muxer!!.addTrack(encoder!!.outputFormat)
+                    muxer!!.start()
+                    isMuxerStarted = true
+                }
+                else -> {
+                    if (outputBufferIndex < 0) {
+                        Log.w("VideoEncoder", "Unexpected result from dequeueOutputBuffer: $outputBufferIndex")
+                        continue
+                    }
+
+                    val outputBuffer = encoder!!.getOutputBuffer(outputBufferIndex) ?: continue
+
+                    if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0 && bufferInfo.size != 0) {
+                        if (!isMuxerStarted) {
+                            // 포맷이 변경되기 전에 데이터가 나오는 경우가 있어 무시
+                        } else {
+                            outputBuffer.position(bufferInfo.offset)
+                            outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
+                            muxer!!.writeSampleData(videoTrackIndex, outputBuffer, bufferInfo)
+                        }
+                    }
+
+                    encoder!!.releaseOutputBuffer(outputBufferIndex, false)
+
+                    if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                        break
+                    }
                 }
             }
         }
     }
 
     fun stop() {
+        // ✨ 6. 중복 호출을 막는 가드
+        if (!isRunning) return
+        Log.d("VideoEncoder", "Stopping encoder...")
+
         isRunning = false
+        // ✨ 7. 큐에 종료 신호를 보내 processFrames 루프를 깨움
+        frameQueue.put(POISON_PILL)
 
-        scope.cancel()
-
+        // ✨ 8. 코루틴이 작업을 마칠 때까지 안전하게 기다림 (cancel() 대신 join())
         runBlocking {
-            scope.coroutineContext.job.join()
+            processFramesJob?.join()
         }
+
         try {
+            // ✨ 9. 모든 리소스를 순서대로 안전하게 해제
             encoder?.stop()
             encoder?.release()
             muxer?.stop()
             muxer?.release()
-            completionDeferred.complete(outputPath)
+
+            Log.d("VideoEncoder", "Encoder stopped successfully.")
+            if (!completionDeferred.isCompleted) {
+                completionDeferred.complete(outputPath)
+            }
         } catch (e: Exception) {
             Log.e("VideoEncoder", "Error stopping encoder/muxer", e)
-            completionDeferred.completeExceptionally(e)
+            if (!completionDeferred.isCompleted) {
+                completionDeferred.completeExceptionally(e)
+            }
         }
     }
 }

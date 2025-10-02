@@ -28,6 +28,7 @@ import android.provider.MediaStore
 import com.nightlens.VideoEncoder
 import android.media.MediaMetadataRetriever
 import java.io.ByteArrayOutputStream
+import android.graphics.Rect
 
 
 
@@ -63,6 +64,8 @@ class IATModelModule(private val reactContext: ReactApplicationContext) :
 
     @ReactMethod
     fun initializeModel(promise: Promise) {
+        Log.d("ModelInitCheck", ">>>> initializeModel 함수가 호출되었습니다! <<<<")
+
         if (interpreter != null) {
             promise.resolve("Model already initialized")
             return
@@ -271,111 +274,148 @@ class IATModelModule(private val reactContext: ReactApplicationContext) :
             var encoder: VideoEncoder? = null
             var completionDeferred: CompletableDeferred<String>? = null
 
+            var matFrame: org.opencv.core.Mat? = null
             var matToBitmap: Bitmap? = null
-            var rotatedBitmap: Bitmap? = null
+            var rotatedBitmap: Bitmap? = null // ✨ 회전 전용 임시 비트맵
+            var processingBitmap: Bitmap? = null
             var modelInput: Bitmap? = null
             var enhancedBitmap: Bitmap? = null
             var finalBitmap: Bitmap? = null
-            var outputBuffer: ByteBuffer? = null
-            var inputBuffer: ByteBuffer? = null
-            var finalPixels: IntArray? = null
-            var rotatedCanvas: android.graphics.Canvas? = null
-            var modelInputCanvas: android.graphics.Canvas? = null
-            var finalCanvas: android.graphics.Canvas? = null
 
             try {
                 if (!OpenCVLoader.initDebug()) {
-                    withContext(Dispatchers.Main) {
-                        promise.reject("OPENCV_LOAD_FAILED", "OpenCV failed to load")
-                    }
+                    withContext(Dispatchers.Main) { promise.reject("OPENCV_LOAD_FAILED", "OpenCV failed to load") }
                     return@launch
                 }
 
                 val cleanPath = inputPath.removePrefix("file://")
-                val file = File(cleanPath)
-                if (!file.exists()) {
-                    withContext(Dispatchers.Main) {
-                        promise.reject("VIDEO_FILE_NOT_FOUND", "Video file does not exist: $cleanPath")
-                    }
-                    return@launch
-                }
-
                 capture = VideoCapture(cleanPath)
                 if (!capture.isOpened) {
-                    withContext(Dispatchers.Main) {
-                        promise.reject("VIDEO_CAPTURE_FAILED", "Cannot open video: $cleanPath")
-                    }
+                    withContext(Dispatchers.Main) { promise.reject("VIDEO_CAPTURE_FAILED", "Cannot open video: $cleanPath") }
                     return@launch
                 }
 
+                matFrame = org.opencv.core.Mat()
+                if (!capture.read(matFrame) || matFrame.empty()) {
+                    withContext(Dispatchers.Main) { promise.reject("VIDEO_READ_FAILED", "Failed to read the first frame.") }
+                    capture.release()
+                    return@launch
+                }
+
+                val actualWidth = matFrame.cols()
+                val actualHeight = matFrame.rows()
                 val rotationAngle = getVideoRotationAngle(cleanPath)
                 val fps = capture.get(org.opencv.videoio.Videoio.CAP_PROP_FPS)
-                var frameWidth = capture.get(org.opencv.videoio.Videoio.CAP_PROP_FRAME_WIDTH).toInt()
-                var frameHeight = capture.get(org.opencv.videoio.Videoio.CAP_PROP_FRAME_HEIGHT).toInt()
 
+                val rotatedWidth: Int
+                val rotatedHeight: Int
                 if (rotationAngle == 90 || rotationAngle == 270) {
-                    val temp = frameWidth
-                    frameWidth = frameHeight
-                    frameHeight = temp
+                    rotatedWidth = actualHeight
+                    rotatedHeight = actualWidth
+                } else {
+                    rotatedWidth = actualWidth
+                    rotatedHeight = actualHeight
                 }
 
                 val outputPath = "${reactContext.cacheDir}/enhanced_video_${System.currentTimeMillis()}.mp4"
                 completionDeferred = CompletableDeferred()
-                encoder = VideoEncoder(outputPath, frameWidth, frameHeight, fps.toInt(), completionDeferred)
+                encoder = VideoEncoder(outputPath, rotatedWidth, rotatedHeight, fps.toInt(), completionDeferred)
                 encoder.start()
 
                 val modelInputSize = 512
-                val modelOutputSize = 512
-                val matFrame = org.opencv.core.Mat()
+                val outputBuffer = ByteBuffer.allocateDirect(modelInputSize * modelInputSize * 3 * 4).order(ByteOrder.nativeOrder())
+                val inputBuffer = ByteBuffer.allocateDirect(modelInputSize * modelInputSize * 3 * 4).order(ByteOrder.nativeOrder())
 
-                outputBuffer = ByteBuffer.allocateDirect(modelOutputSize * modelOutputSize * 3 * 4).order(ByteOrder.nativeOrder())
-                inputBuffer = ByteBuffer.allocateDirect(modelInputSize * modelInputSize * 4).order(ByteOrder.nativeOrder())
-
-                matToBitmap = Bitmap.createBitmap(frameWidth, frameHeight, Bitmap.Config.ARGB_8888)
-                rotatedBitmap = Bitmap.createBitmap(frameWidth, frameHeight, Bitmap.Config.ARGB_8888)
-                modelInput = Bitmap.createBitmap(modelInputSize, modelInputSize, Bitmap.Config.ARGB_8888)
-                enhancedBitmap = Bitmap.createBitmap(modelOutputSize, modelOutputSize, Bitmap.Config.ARGB_8888)
-                finalBitmap = Bitmap.createBitmap(frameWidth, frameHeight, Bitmap.Config.ARGB_8888)
-                finalPixels = IntArray(frameWidth * frameHeight)
-                val finalMatrix = Matrix()
-                rotatedCanvas = android.graphics.Canvas(rotatedBitmap!!)
-                modelInputCanvas = android.graphics.Canvas(modelInput!!)
-                finalCanvas = android.graphics.Canvas(finalBitmap!!)
-
-
-                while (capture.read(matFrame)) {
-                    if (matFrame.dims() != 2) {
-                        continue
-                    }
-
-                    Utils.matToBitmap(matFrame, matToBitmap!!)
-
-                    val matrix = Matrix()
-                    matrix.postRotate(rotationAngle.toFloat())
-                    rotatedCanvas!!.drawBitmap(matToBitmap!!, matrix, null)
-
-                    val modelInputMatrix = Matrix()
-                    modelInputMatrix.setScale(modelInputSize.toFloat() / rotatedBitmap!!.width, modelInputSize.toFloat() / rotatedBitmap!!.height)
-                    modelInputCanvas!!.drawBitmap(rotatedBitmap!!, modelInputMatrix, null)
-
-                    // ✨ 수정 1: 기존에 할당된 inputBuffer를 재사용합니다.
-                    dataConverter!!.convertBitmapToByteBuffer(modelInput!!, inputBuffer!!)
-                    outputBuffer!!.rewind()
-                    interpreter!!.run(inputBuffer!!, outputBuffer!!)
-                    outputBuffer!!.rewind()
-
-                    // ✨ 수정 2: dataConverter.convertByteBufferToBitmap 함수를 Bitmap을 재사용하도록 수정해야 합니다.
-                    dataConverter!!.convertByteBufferToBitmap(outputBuffer!!, enhancedBitmap!!, modelOutputSize, modelOutputSize)
-
-                    finalMatrix.setScale(frameWidth.toFloat() / enhancedBitmap!!.width, frameHeight.toFloat() / enhancedBitmap!!.height)
-                    finalCanvas!!.drawBitmap(enhancedBitmap!!, finalMatrix, null)
-
-                    finalBitmap!!.getPixels(finalPixels, 0, frameWidth, 0, 0, frameWidth, frameHeight)
-                    encoder.enqueueFrame(finalPixels!!)
+                val processingWidth: Int
+                val processingHeight: Int
+                val aspectRatio = rotatedWidth.toFloat() / rotatedHeight.toFloat()
+                if (rotatedWidth > rotatedHeight) {
+                    processingWidth = 960
+                    processingHeight = (960 / aspectRatio).toInt()
+                } else {
+                    processingHeight = 960
+                    processingWidth = (960 * aspectRatio).toInt()
                 }
 
+                matToBitmap = Bitmap.createBitmap(actualWidth, actualHeight, Bitmap.Config.ARGB_8888)
+                rotatedBitmap = Bitmap.createBitmap(rotatedWidth, rotatedHeight, Bitmap.Config.ARGB_8888) // ✨ 회전된 결과를 담을 비트맵
+                processingBitmap = Bitmap.createBitmap(processingWidth, processingHeight, Bitmap.Config.ARGB_8888)
+                modelInput = Bitmap.createBitmap(modelInputSize, modelInputSize, Bitmap.Config.ARGB_8888)
+                enhancedBitmap = Bitmap.createBitmap(modelInputSize, modelInputSize, Bitmap.Config.ARGB_8888)
+                finalBitmap = Bitmap.createBitmap(rotatedWidth, rotatedHeight, Bitmap.Config.ARGB_8888)
+                val finalPixels = IntArray(rotatedWidth * rotatedHeight)
+
+                val rotatedCanvas = Canvas(rotatedBitmap)
+                val processingCanvas = Canvas(processingBitmap)
+                val modelInputCanvas = Canvas(modelInput)
+                val finalCanvas = Canvas(finalBitmap)
+                val rotateMatrix = Matrix()
+
+                do {
+                    Utils.matToBitmap(matFrame, matToBitmap)
+
+                    // ✨ 1. 회전 로직 수정: 원본을 회전시켜 rotatedBitmap에 그립니다.
+                    rotateMatrix.reset()
+                    rotateMatrix.postRotate(rotationAngle.toFloat(), actualWidth / 2f, actualHeight / 2f)
+                    if (rotationAngle == 90 || rotationAngle == 270) {
+                        rotateMatrix.postTranslate((rotatedWidth - actualWidth) / 2f, (rotatedHeight - actualHeight) / 2f)
+                    }
+                    rotatedCanvas.drawColor(android.graphics.Color.BLACK)
+                    rotatedCanvas.drawBitmap(matToBitmap!!, rotateMatrix, null)
+
+                    // ✨ 2. 회전된 비트맵에 패딩을 적용하여 정사각형으로 만듭니다.
+                    val paddedBitmap = padToSquare(rotatedBitmap!!)
+
+                    // ✨ 3. 패딩된 정사각형 비트맵을 모델 입력 크기(512x512)로 조정합니다.
+                    modelInputCanvas.drawBitmap(
+                        paddedBitmap,
+                        Rect(0, 0, paddedBitmap.width, paddedBitmap.height),
+                        Rect(0, 0, modelInputSize, modelInputSize),
+                        null
+                    )
+
+                    paddedBitmap.recycle() // 사용한 패딩 비트맵은 바로 해제
+
+                    // --- 이하 모델 추론 및 인코딩 로직은 동일 ---
+                    inputBuffer.rewind()
+                    dataConverter!!.convertBitmapToByteBuffer(modelInput!!, inputBuffer)
+                    outputBuffer.rewind()
+                    interpreter!!.run(inputBuffer, outputBuffer)
+                    outputBuffer.rewind()
+                    dataConverter!!.convertByteBufferToBitmap(outputBuffer, enhancedBitmap!!, modelInputSize, modelInputSize)
+
+                    // 모델 결과물(enhancedBitmap)에서 패딩을 제거하고 최종 프레임(finalBitmap)에 그립니다.
+
+                    val sourceRect = Rect()
+                    val destRect = Rect(0, 0, rotatedWidth, rotatedHeight)
+
+                    if (rotatedWidth > rotatedHeight) { // 가로가 긴 영상 (위아래에 패딩)
+                        val cropHeight = (modelInputSize * rotatedHeight.toFloat() / rotatedWidth.toFloat()).toInt()
+                        val topOffset = (modelInputSize - cropHeight) / 2
+                        sourceRect.set(0, topOffset, modelInputSize, topOffset + cropHeight)
+                    } else { // 세로가 길거나 정사각형 영상 (양옆에 패딩)
+                        val cropWidth = (modelInputSize * rotatedWidth.toFloat() / rotatedHeight.toFloat()).toInt()
+                        val leftOffset = (modelInputSize - cropWidth) / 2
+                        sourceRect.set(leftOffset, 0, leftOffset + cropWidth, modelInputSize)
+                    }
+
+                    finalCanvas.drawBitmap(enhancedBitmap!!, sourceRect, destRect, null)
+
+                    finalBitmap!!.getPixels(finalPixels, 0, rotatedWidth, 0, 0, rotatedWidth, rotatedHeight)
+
+                    var enqueued = false
+                    while (!enqueued) {
+                        enqueued = encoder.enqueueFrame(finalPixels)
+                        if (!enqueued) {
+                            Log.d("VideoStallDebug", "Encoder queue is full. Waiting for 10ms...")
+                            delay(10)
+                        }
+                    }
+
+                } while (capture.read(matFrame) && !matFrame.empty())
+
                 encoder.stop()
-                val finalOutputPath = completionDeferred!!.await()
+                val finalOutputPath = completionDeferred.await()
 
                 withContext(Dispatchers.Main) {
                     promise.resolve(finalOutputPath)
@@ -387,13 +427,14 @@ class IATModelModule(private val reactContext: ReactApplicationContext) :
                 }
             } finally {
                 capture?.release()
+                try { encoder?.stop() } catch (e: Exception) { /* ignore */ }
+                matFrame?.release()
                 matToBitmap?.recycle()
-                rotatedBitmap?.recycle()
+                rotatedBitmap?.recycle() // ✨ 추가된 리소스 해제
+                processingBitmap?.recycle()
                 modelInput?.recycle()
                 enhancedBitmap?.recycle()
                 finalBitmap?.recycle()
-                outputBuffer?.clear()
-                inputBuffer?.clear()
             }
         }
     }
